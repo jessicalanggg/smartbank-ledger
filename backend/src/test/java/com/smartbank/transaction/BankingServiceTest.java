@@ -1,6 +1,9 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.*;
+import com.smartbank.ledger.LedgerAccount;
+import com.smartbank.ledger.LedgerEntry;
+import com.smartbank.ledger.LedgerEntryRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 import java.math.BigDecimal;
@@ -8,12 +11,14 @@ import java.util.Optional;
 import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.*;
 
 class BankingServiceTest {
     private final AccountRepository accounts = mock(AccountRepository.class);
     private final BankingTransactionRepository transactions = mock(BankingTransactionRepository.class);
-    private final BankingService service = new BankingService(accounts, transactions);
+    private final LedgerEntryRepository ledger = mock(LedgerEntryRepository.class);
+    private final BankingService service = new BankingService(accounts, transactions, ledger);
 
     private Account account(UUID id, String balance, String currency) {
         Account a = new AccountFixture().make(id, balance, currency);
@@ -43,6 +48,7 @@ class BankingServiceTest {
         assertEquals(0, a.getBalance().compareTo(new BigDecimal("1050.00")));
         assertEquals(0, b.getBalance().compareTo(new BigDecimal("4000.50")));
         verify(transactions).saveAndFlush(any());
+        verify(ledger).saveAllAndFlush(anyList());
     }
     @Test void insufficientFundsDoesNotCreditTarget() {
         UUID from = UUID.randomUUID(), to = UUID.randomUUID();
@@ -92,5 +98,31 @@ class BankingServiceTest {
         assertThrows(BankingException.class,
             () -> service.withdraw(id, new MoneyRequest(new BigDecimal("5.00"), "dep")));
         verify(transactions, never()).saveAndFlush(any());
+    }
+    @Test void everyTransactionTypePostsBalancedEntries() {
+        UUID a = UUID.randomUUID(), b = UUID.randomUUID();
+        BigDecimal amount = new BigDecimal("12.34");
+        var cases = java.util.List.of(
+            new BankingTransaction(TransactionType.DEPOSIT, null, b, amount, "CAD", null),
+            new BankingTransaction(TransactionType.WITHDRAWAL, a, null, amount, "CAD", null),
+            new BankingTransaction(TransactionType.TRANSFER, a, b, amount, "CAD", null),
+            new BankingTransaction(TransactionType.OPENING_BALANCE, null, b, amount, "CAD", null));
+        for (BankingTransaction tx : cases) {
+            var entries = BankingService.postings(tx);
+            assertEquals(2, entries.size(), tx.getTransactionType().name());
+            assertEquals(0, entries.stream().map(LedgerEntry::getAmount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add).signum(), tx.getTransactionType() + " must sum to zero");
+            assertTrue(entries.stream().allMatch(e -> e.getTransactionId().equals(tx.getId())));
+            if (tx.getDestinationAccountId() != null)
+                assertTrue(entries.stream().anyMatch(e -> tx.getDestinationAccountId().equals(e.getAccountId())
+                    && e.getAmount().compareTo(amount) == 0), "destination is credited");
+            if (tx.getSourceAccountId() != null)
+                assertTrue(entries.stream().anyMatch(e -> tx.getSourceAccountId().equals(e.getAccountId())
+                    && e.getAmount().compareTo(amount.negate()) == 0), "source is debited");
+        }
+    }
+    @Test void internalEntriesCannotPostToCustomerLedgerAccount() {
+        assertThrows(IllegalArgumentException.class, () -> LedgerEntry.internal(
+            UUID.randomUUID(), LedgerAccount.CUSTOMER, BigDecimal.ONE, "CAD", java.time.Instant.now()));
     }
 }

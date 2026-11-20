@@ -1,6 +1,9 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.AccountRepository;
+import com.smartbank.ledger.LedgerReconciliation;
+import com.smartbank.support.LedgerTestData;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -35,13 +38,24 @@ class BankingIntegrationTest {
     AccountRepository accounts;
     @Autowired
     JdbcTemplate jdbc;
+    @Autowired
+    LedgerReconciliation reconciliation;
 
     @BeforeEach
     void resetDatabase() {
-        // Each test starts with Flyway's seeded balances and no transaction records.
-        jdbc.update("DELETE FROM banking_transactions");
+        // Each test starts with Flyway's seeded balances, posted as opening balances.
+        LedgerTestData.truncateLedger(jdbc);
         jdbc.update("UPDATE accounts SET balance = 1250.00, version = version + 1 WHERE id = ?", A);
         jdbc.update("UPDATE accounts SET balance = 3800.50, version = version + 1 WHERE id = ?", B);
+        LedgerTestData.postOpeningBalancesForAllAccounts(jdbc);
+    }
+
+    @AfterEach
+    void booksStillBalance() {
+        // Whatever a test did, including failed and rejected operations, the ledger
+        // must still balance and agree with every cached account balance.
+        var report = reconciliation.run();
+        assertTrue(report.isClean(), () -> "Ledger out of balance: " + report);
     }
 
     private BigDecimal balance(UUID id) {
@@ -53,7 +67,7 @@ class BankingIntegrationTest {
     }
 
     private long transactionCount() {
-        return jdbc.queryForObject("SELECT COUNT(*) FROM banking_transactions", Long.class);
+        return LedgerTestData.postedTransactionCount(jdbc);
     }
 
     @Test

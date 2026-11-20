@@ -1,6 +1,9 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.*;
+import com.smartbank.ledger.LedgerAccount;
+import com.smartbank.ledger.LedgerEntry;
+import com.smartbank.ledger.LedgerEntryRepository;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -12,10 +15,13 @@ import java.util.UUID;
 public class BankingService {
     private final AccountRepository accounts;
     private final BankingTransactionRepository transactions;
+    private final LedgerEntryRepository ledger;
 
-    public BankingService(AccountRepository accounts, BankingTransactionRepository transactions) {
+    public BankingService(AccountRepository accounts, BankingTransactionRepository transactions,
+            LedgerEntryRepository ledger) {
         this.accounts = accounts;
         this.transactions = transactions;
+        this.ledger = ledger;
     }
 
     @Transactional
@@ -137,9 +143,37 @@ public class BankingService {
         return accounts.findLockedById(id).orElseThrow(() -> new AccountNotFoundException(id));
     }
 
+    /**
+     * Writes the transaction and its balanced ledger entries. Runs inside the
+     * caller's transaction, so balances, transaction and entries commit together.
+     */
     private TransactionResponse record(TransactionType type, UUID from, UUID to,
             BigDecimal amount, String currency, String key) {
-        return TransactionResponse.from(transactions.saveAndFlush(
-                new BankingTransaction(type, from, to, amount, currency, key)));
+        BankingTransaction tx = transactions.saveAndFlush(
+                new BankingTransaction(type, from, to, amount, currency, key));
+        ledger.saveAllAndFlush(postings(tx));
+        return TransactionResponse.from(tx);
+    }
+
+    /** The double-entry postings for a transaction; their amounts sum to zero. */
+    static List<LedgerEntry> postings(BankingTransaction tx) {
+        UUID id = tx.getId();
+        BigDecimal amount = tx.getAmount();
+        String currency = tx.getCurrency();
+        var at = tx.getCreatedAt();
+        return switch (tx.getTransactionType()) {
+            case DEPOSIT -> List.of(
+                    LedgerEntry.internal(id, LedgerAccount.EXTERNAL_CLEARING, amount.negate(), currency, at),
+                    LedgerEntry.customer(id, tx.getDestinationAccountId(), amount, currency, at));
+            case WITHDRAWAL -> List.of(
+                    LedgerEntry.customer(id, tx.getSourceAccountId(), amount.negate(), currency, at),
+                    LedgerEntry.internal(id, LedgerAccount.EXTERNAL_CLEARING, amount, currency, at));
+            case TRANSFER -> List.of(
+                    LedgerEntry.customer(id, tx.getSourceAccountId(), amount.negate(), currency, at),
+                    LedgerEntry.customer(id, tx.getDestinationAccountId(), amount, currency, at));
+            case OPENING_BALANCE -> List.of(
+                    LedgerEntry.internal(id, LedgerAccount.OPENING_EQUITY, amount.negate(), currency, at),
+                    LedgerEntry.customer(id, tx.getDestinationAccountId(), amount, currency, at));
+        };
     }
 }

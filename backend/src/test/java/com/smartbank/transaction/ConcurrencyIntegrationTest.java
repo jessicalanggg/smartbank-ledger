@@ -1,5 +1,7 @@
 package com.smartbank.transaction;
 
+import com.smartbank.ledger.LedgerReconciliation;
+import com.smartbank.support.LedgerTestData;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -41,21 +43,19 @@ class ConcurrencyIntegrationTest {
     BankingService banking;
     @Autowired
     JdbcTemplate jdbc;
+    @Autowired
+    LedgerReconciliation reconciliation;
 
     private final List<UUID> accountIds = new ArrayList<>();
 
     @BeforeEach
     void createAccounts() {
-        jdbc.update("DELETE FROM banking_transactions");
+        LedgerTestData.truncateLedger(jdbc);
         jdbc.update("DELETE FROM accounts WHERE account_number LIKE 'CONC-%'");
+        LedgerTestData.postOpeningBalancesForAllAccounts(jdbc);
         accountIds.clear();
         for (int i = 0; i < ACCOUNTS; i++) {
-            UUID id = UUID.randomUUID();
-            jdbc.update("""
-                    INSERT INTO accounts (id, account_number, owner_name, account_type, balance, currency)
-                    VALUES (?, ?, 'Concurrency Test', 'CHECKING', ?, 'CAD')""",
-                    id, "CONC-%05d".formatted(i), OPENING_BALANCE);
-            accountIds.add(id);
+            accountIds.add(LedgerTestData.openAccount(jdbc, "CONC-%05d".formatted(i), OPENING_BALANCE, "CAD"));
         }
     }
 
@@ -97,12 +97,11 @@ class ConcurrencyIntegrationTest {
         assertEquals(0, totalBefore.compareTo(totalBalance()), "Total money must be conserved");
         assertEquals(0, jdbc.queryForObject(
                 "SELECT COUNT(*) FROM accounts WHERE account_number LIKE 'CONC-%' AND balance < 0", Integer.class));
-        assertEquals(succeeded.get(), jdbc.queryForObject(
-                "SELECT COUNT(*) FROM banking_transactions", Integer.class),
+        assertEquals(succeeded.get(), (int) LedgerTestData.postedTransactionCount(jdbc),
                 "Exactly one transaction row per successful transfer");
-        assertEquals(0, ledgerMismatches(), "Every balance must equal opening balance + credits - debits");
+        assertLedgerClean();
 
-        System.out.printf("[concurrency] %d transfers on %d threads in %d ms (%.0f/s): %d committed, %d rejected for insufficient funds, 0 discrepancies%n",
+        System.out.printf("[concurrency] %d transfers on %d threads in %d ms (%.0f/s): %d committed, %d rejected for insufficient funds, ledger reconciled%n",
                 TRANSFERS, THREADS, elapsedMs, TRANSFERS * 1000.0 / elapsedMs, succeeded.get(), insufficientFunds.get());
     }
 
@@ -126,7 +125,7 @@ class ConcurrencyIntegrationTest {
         // Every retry must be answered with the original transaction, not an error.
         assertTrue(failures.isEmpty(), () -> "Retries failed: " + failures.stream().limit(5).toList());
         assertEquals(1, returnedIds.size(), "All retries must return the same transaction");
-        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM banking_transactions", Integer.class));
+        assertEquals(1, (int) LedgerTestData.postedTransactionCount(jdbc));
         assertMoney("900.00", balance(from));
         assertMoney("1100.00", balance(to));
     }
@@ -160,9 +159,9 @@ class ConcurrencyIntegrationTest {
         runConcurrently(work);
 
         assertTrue(unexpected.isEmpty(), () -> "Unexpected failures: " + unexpected.stream().limit(5).toList());
-        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM banking_transactions", Integer.class));
+        assertEquals(1, (int) LedgerTestData.postedTransactionCount(jdbc));
         assertMoney("950.00", balance(from));
-        assertEquals(0, ledgerMismatches());
+        assertLedgerClean();
         assertTrue(succeeded.get() >= 1, "The one posted transfer must be reported as a success");
     }
 
@@ -193,9 +192,9 @@ class ConcurrencyIntegrationTest {
         assertTrue(failures.isEmpty(), () -> "Retries failed: " + failures.stream().limit(5).toList());
         assertEquals(1, depositIds.size(), "All deposit retries must return the same transaction");
         assertEquals(1, withdrawalIds.size(), "All withdrawal retries must return the same transaction");
-        assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM banking_transactions", Integer.class));
+        assertEquals(2, (int) LedgerTestData.postedTransactionCount(jdbc));
         assertMoney("965.00", balance(account));
-        assertEquals(0, ledgerMismatches());
+        assertLedgerClean();
     }
 
     /** Starts every task at the same instant and returns the wall-clock time taken. */
@@ -225,15 +224,10 @@ class ConcurrencyIntegrationTest {
         return jdbc.queryForObject("SELECT balance FROM accounts WHERE id = ?", BigDecimal.class, id);
     }
 
-    /** Accounts whose stored balance disagrees with what the transaction log implies. */
-    private int ledgerMismatches() {
-        return jdbc.queryForObject("""
-                SELECT COUNT(*) FROM accounts a
-                WHERE a.account_number LIKE 'CONC-%'
-                  AND a.balance <> ?
-                      + COALESCE((SELECT SUM(amount) FROM banking_transactions t WHERE t.destination_account_id = a.id), 0)
-                      - COALESCE((SELECT SUM(amount) FROM banking_transactions t WHERE t.source_account_id = a.id), 0)""",
-                Integer.class, OPENING_BALANCE);
+    /** The ledger balances and every cached balance equals the sum of its account's entries. */
+    private void assertLedgerClean() {
+        var report = reconciliation.run();
+        assertTrue(report.isClean(), () -> "Ledger out of balance: " + report);
     }
 
     private static void assertMoney(String expected, BigDecimal actual) {
