@@ -74,4 +74,23 @@ class BankingServiceTest {
         assertEquals(previous.getId(), result.id());
         verify(accounts, never()).findLockedById(any());
     }
+    @Test void duplicateDepositReturnsOriginalWithoutLocking() {
+        UUID id = UUID.randomUUID();
+        BankingTransaction previous = new BankingTransaction(TransactionType.DEPOSIT, null, id,
+            new BigDecimal("5.00"), "CAD", "dep");
+        when(transactions.findByRequestKey("dep")).thenReturn(Optional.of(previous));
+        var result = service.deposit(id, new MoneyRequest(new BigDecimal("5.00"), "dep"));
+        assertEquals(previous.getId(), result.id());
+        verify(accounts, never()).findLockedById(any());
+        verify(transactions, never()).saveAndFlush(any());
+    }
+    @Test void depositKeyReusedForWithdrawalIsRejected() {
+        UUID id = UUID.randomUUID();
+        BankingTransaction previous = new BankingTransaction(TransactionType.DEPOSIT, null, id,
+            new BigDecimal("5.00"), "CAD", "dep");
+        when(transactions.findByRequestKey("dep")).thenReturn(Optional.of(previous));
+        assertThrows(BankingException.class,
+            () -> service.withdraw(id, new MoneyRequest(new BigDecimal("5.00"), "dep")));
+        verify(transactions, never()).saveAndFlush(any());
+    }
 }

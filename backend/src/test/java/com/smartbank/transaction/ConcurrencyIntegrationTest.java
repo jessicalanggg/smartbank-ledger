@@ -166,6 +166,38 @@ class ConcurrencyIntegrationTest {
         assertTrue(succeeded.get() >= 1, "The one posted transfer must be reported as a success");
     }
 
+    @Test
+    void identicalDepositsAndWithdrawalsFiredSimultaneouslyPostExactlyOnce() throws Exception {
+        UUID account = accountIds.get(0);
+        MoneyRequest depositRequest = new MoneyRequest(new BigDecimal("25.00"), "dup-deposit");
+        MoneyRequest withdrawalRequest = new MoneyRequest(new BigDecimal("60.00"), "dup-withdrawal");
+        Set<UUID> depositIds = ConcurrentHashMap.newKeySet();
+        Set<UUID> withdrawalIds = ConcurrentHashMap.newKeySet();
+        ConcurrentLinkedQueue<Throwable> failures = new ConcurrentLinkedQueue<>();
+
+        List<Callable<Void>> work = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            work.add(() -> {
+                try { depositIds.add(banking.deposit(account, depositRequest).id()); }
+                catch (Throwable t) { failures.add(t); }
+                return null;
+            });
+            work.add(() -> {
+                try { withdrawalIds.add(banking.withdraw(account, withdrawalRequest).id()); }
+                catch (Throwable t) { failures.add(t); }
+                return null;
+            });
+        }
+        runConcurrently(work);
+
+        assertTrue(failures.isEmpty(), () -> "Retries failed: " + failures.stream().limit(5).toList());
+        assertEquals(1, depositIds.size(), "All deposit retries must return the same transaction");
+        assertEquals(1, withdrawalIds.size(), "All withdrawal retries must return the same transaction");
+        assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM banking_transactions", Integer.class));
+        assertMoney("965.00", balance(account));
+        assertEquals(0, ledgerMismatches());
+    }
+
     /** Starts every task at the same instant and returns the wall-clock time taken. */
     private long runConcurrently(List<Callable<Void>> work) throws Exception {
         ExecutorService pool = Executors.newFixedThreadPool(THREADS);

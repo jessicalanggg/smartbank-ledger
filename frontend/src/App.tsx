@@ -64,6 +64,7 @@ export default function App() {
     const [transferReceipt, setTransferReceipt] = useState<{ transaction: TransferReceipt; from: string; to: string } | null>(null);
     const [transferUncertain, setTransferUncertain] = useState(false);
     const transferInFlight = useRef(false);
+    const pendingMoneyAction = useRef<{ action: string; accountId: string; amount: string; requestKey: string } | null>(null);
     const [page, setPage] = useState<"overview" | "transactions">("overview");
     const [filter, setFilter] = useState("all");
     const [search, setSearch] = useState("");
@@ -130,12 +131,21 @@ export default function App() {
             setError("Enter a positive amount with up to two decimal places.");
             return;
         }
+        // Reuse the key when the user retries the exact same failed operation, so a
+        // request that reached the server before the error is not posted twice.
+        const last = pendingMoneyAction.current;
+        const requestKey =
+            last && last.action === action && last.accountId === selected && last.amount === amount
+                ? last.requestKey
+                : crypto.randomUUID();
+        pendingMoneyAction.current = { action, accountId: selected, amount, requestKey };
         setLoading(true);
         setError("");
         try {
             if (action === "deposit")
-                await deposit(token, selected, value, description);
-            else await withdraw(token, selected, value, description);
+                await deposit(token, selected, value, description, requestKey);
+            else await withdraw(token, selected, value, description, requestKey);
+            pendingMoneyAction.current = null;
             setAmount("");
             setDescription("");
             await load(token);

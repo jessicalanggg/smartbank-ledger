@@ -20,16 +20,35 @@ public class BankingService {
 
     @Transactional
     public TransactionResponse deposit(UUID accountId, MoneyRequest request) {
-        Account account = locked(accountId);
-        account.credit(request.amount());
-        return record(TransactionType.DEPOSIT, null, accountId, request.amount(), account.getCurrency(), null);
+        return postSingleAccount(TransactionType.DEPOSIT, accountId, request);
     }
 
     @Transactional
     public TransactionResponse withdraw(UUID accountId, MoneyRequest request) {
+        return postSingleAccount(TransactionType.WITHDRAWAL, accountId, request);
+    }
+
+    /**
+     * Deposits and withdrawals follow the same idempotency protocol as transfers:
+     * check the key, lock the account, re-check the key while holding the lock
+     * (a concurrent identical request commits before we get the lock), then post.
+     * Conflicting reuse that is not serialised by the lock is stopped by the
+     * UNIQUE constraint on request_key.
+     */
+    private TransactionResponse postSingleAccount(TransactionType type, UUID accountId, MoneyRequest request) {
+        var previous = transactions.findByRequestKey(request.requestKey());
+        if (previous.isPresent())
+            return replay(previous.get(), type, accountId, request.amount());
         Account account = locked(accountId);
+        previous = transactions.findByRequestKey(request.requestKey());
+        if (previous.isPresent())
+            return replay(previous.get(), type, accountId, request.amount());
+        if (type == TransactionType.DEPOSIT) {
+            account.credit(request.amount());
+            return record(type, null, accountId, request.amount(), account.getCurrency(), request.requestKey());
+        }
         account.debit(request.amount());
-        return record(TransactionType.WITHDRAWAL, accountId, null, request.amount(), account.getCurrency(), null);
+        return record(type, accountId, null, request.amount(), account.getCurrency(), request.requestKey());
     }
 
     @Transactional
@@ -98,6 +117,18 @@ public class BankingService {
                 || !request.fromAccountId().equals(prior.getSourceAccountId())
                 || !request.toAccountId().equals(prior.getDestinationAccountId())
                 || request.amount().compareTo(prior.getAmount()) != 0)
+            throw new BankingException("Request key was already used for a different operation");
+        return TransactionResponse.from(prior);
+    }
+
+    private TransactionResponse replay(BankingTransaction prior, TransactionType type, UUID accountId,
+            BigDecimal amount) {
+        UUID priorAccount = type == TransactionType.DEPOSIT
+                ? prior.getDestinationAccountId()
+                : prior.getSourceAccountId();
+        if (prior.getTransactionType() != type
+                || !accountId.equals(priorAccount)
+                || amount.compareTo(prior.getAmount()) != 0)
             throw new BankingException("Request key was already used for a different operation");
         return TransactionResponse.from(prior);
     }

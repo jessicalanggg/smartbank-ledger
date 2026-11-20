@@ -17,8 +17,8 @@ export async function request<T>(path: string, token: string | null, init: Reque
 export function login(email: string, password: string) { return request<LoginResponse>('/auth/login', null, { method: 'POST', body: JSON.stringify({ email, password }) }); }
 export function accounts(token: string) { return request<Account[]>('/accounts', token); }
 export function transactions(token: string, id: string) { return request<Transaction[]>(`/accounts/${encodeURIComponent(id)}/transactions`, token); }
-export function deposit(token: string, id: string, amount: number, description: string) { return request<unknown>(`/accounts/${encodeURIComponent(id)}/deposits`, token, { method: 'POST', body: JSON.stringify({ amount, description }) }); }
-export function withdraw(token: string, id: string, amount: number, description: string) { return request<unknown>(`/accounts/${encodeURIComponent(id)}/withdrawals`, token, { method: 'POST', body: JSON.stringify({ amount, description }) }); }
+export function deposit(token: string, id: string, amount: number, description: string, requestKey: string) { return request<unknown>(`/accounts/${encodeURIComponent(id)}/deposits`, token, { method: 'POST', body: JSON.stringify({ amount, description, requestKey }) }); }
+export function withdraw(token: string, id: string, amount: number, description: string, requestKey: string) { return request<unknown>(`/accounts/${encodeURIComponent(id)}/withdrawals`, token, { method: 'POST', body: JSON.stringify({ amount, description, requestKey }) }); }
 // Transfer request field names must be verified against your Spring Boot TransferRequest DTO before enabling transfers.
 export function transfer(
   token: string,

@@ -150,4 +150,65 @@ class BankingIntegrationTest {
         assertMoney("3800.50", balance(B));
         assertEquals(0L, transactionCount());
     }
+
+    @Test
+    void repeatedDepositWithSameKeyPostsOnce() {
+        MoneyRequest request = new MoneyRequest(new BigDecimal("40.00"), "it-deposit-repeat");
+        TransactionResponse first = banking.deposit(A, request);
+        TransactionResponse second = banking.deposit(A, request);
+
+        assertEquals(first.id(), second.id());
+        assertMoney("1290.00", balance(A));
+        assertEquals(1L, transactionCount());
+    }
+
+    @Test
+    void repeatedWithdrawalWithSameKeyPostsOnce() {
+        MoneyRequest request = new MoneyRequest(new BigDecimal("40.00"), "it-withdraw-repeat");
+        TransactionResponse first = banking.withdraw(A, request);
+        TransactionResponse second = banking.withdraw(A, request);
+
+        assertEquals(first.id(), second.id());
+        assertMoney("1210.00", balance(A));
+        assertEquals(1L, transactionCount());
+    }
+
+    @Test
+    void depositKeyReusedWithDifferentAmountAccountOrTypeIsRejected() {
+        banking.deposit(A, new MoneyRequest(new BigDecimal("10.00"), "it-deposit-conflict"));
+
+        assertThrows(BankingException.class,
+                () -> banking.deposit(A, new MoneyRequest(new BigDecimal("11.00"), "it-deposit-conflict")));
+        assertThrows(BankingException.class,
+                () -> banking.deposit(B, new MoneyRequest(new BigDecimal("10.00"), "it-deposit-conflict")));
+        assertThrows(BankingException.class,
+                () -> banking.withdraw(A, new MoneyRequest(new BigDecimal("10.00"), "it-deposit-conflict")));
+        assertThrows(BankingException.class, () -> banking.transfer(
+                new TransferRequest(A, B, new BigDecimal("10.00"), "it-deposit-conflict")));
+
+        assertMoney("1260.00", balance(A));
+        assertMoney("3800.50", balance(B));
+        assertEquals(1L, transactionCount());
+    }
+
+    @Test
+    void transferKeyCannotBeReplayedAsDeposit() {
+        banking.transfer(new TransferRequest(A, B, new BigDecimal("10.00"), "it-transfer-then-deposit"));
+        assertThrows(BankingException.class,
+                () -> banking.deposit(B, new MoneyRequest(new BigDecimal("10.00"), "it-transfer-then-deposit")));
+        assertMoney("3810.50", balance(B));
+        assertEquals(1L, transactionCount());
+    }
+
+    @Test
+    void failedWithdrawalDoesNotConsumeKey() {
+        assertThrows(BankingException.class,
+                () -> banking.withdraw(A, new MoneyRequest(new BigDecimal("5000.00"), "it-withdraw-retry")));
+        assertEquals(0L, transactionCount());
+
+        // Insufficient funds rolled back, so the key is free for a corrected retry.
+        banking.withdraw(A, new MoneyRequest(new BigDecimal("50.00"), "it-withdraw-retry"));
+        assertMoney("1200.00", balance(A));
+        assertEquals(1L, transactionCount());
+    }
 }
