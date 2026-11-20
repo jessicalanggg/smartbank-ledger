@@ -7,11 +7,12 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 ## What it does
 
 - **Accounts, deposits, withdrawals and transfers** through a versioned REST API (`/api/v1`), with transaction history per account.
-- **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates and the transaction record commit together or roll back together.
+- **Double-entry ledger.** Every transaction posts balanced, append-only ledger entries: a transfer debits one customer account and credits another; a deposit or withdrawal posts against an `EXTERNAL_CLEARING` account. PostgreSQL rejects at commit any transaction whose entries do not sum to zero, and rejects any `UPDATE` or `DELETE` of entries or transactions. A reconciliation check proves every cached account balance equals the sum of its entries.
+- **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
 - **Idempotent requests.** Every deposit, withdrawal and transfer carries a client-generated `requestKey`. A retry with the same key returns the original transaction instead of posting again, even when many retries arrive at the same moment. Reusing a key for a different operation returns HTTP 409.
 - **Deadlock-free locking.** Accounts are locked with `PESSIMISTIC_WRITE`. A transfer always locks its two accounts in UUID order, so opposing transfers (A→B and B→A) cannot deadlock.
 - **Authentication and authorization.** Spring Security with stateless JWT (HS256, 30-minute expiry) and BCrypt password hashing. Users can only read, debit or view the history of accounts they own.
-- **Database-enforced invariants.** Flyway migrations define `CHECK (balance >= 0)`, positive amounts, valid transaction shapes, and a `UNIQUE` request key, so the database rejects bad states even if application code is wrong.
+- **Database-enforced invariants.** Flyway migrations define `CHECK (balance >= 0)`, positive amounts, valid transaction shapes, a `UNIQUE` request key, balanced ledger postings and append-only history, so the database rejects bad states even if application code is wrong.
 - **React frontend** with login, accounts, history, deposits, withdrawals and transfers by account number, including safe retry with the same request key.
 
 ## Verified by tests
@@ -20,14 +21,29 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 
 | Test | What it proves |
 | --- | --- |
-| 5,000 random concurrent transfers (32 threads, 10 accounts) | Total money is conserved, no balance goes negative, no deadlocks, exactly one row per successful transfer, and every balance reconciles with the transaction log |
+| 5,000 random concurrent transfers (32 threads, 10 accounts) | Total money is conserved, no balance goes negative, no deadlocks, exactly one row per successful transfer, and the ledger reconciles with every balance |
 | 100 identical transfers fired at once | Posted exactly once; every caller gets the same transaction |
 | 90 conflicting transfers sharing one key, fired at once | Posted at most once, although the requests lock different accounts |
 | 100 identical deposits + 100 identical withdrawals fired at once | Each posted exactly once |
-| Integration tests | Rollback on insufficient funds and on database constraint failures, key-reuse conflicts, cross-currency rejection |
+| Ledger tests | Each operation posts the right balanced entries; unbalanced postings, transactions without entries, and edits or deletes of history are rejected by PostgreSQL; reconciliation detects a balance changed outside the ledger |
+| Migration test | Upgrading a database with pre-ledger history backfills entries and opening balances that reconcile exactly |
+| Integration tests | Rollback on insufficient funds and on database constraint failures, key-reuse conflicts, cross-currency rejection. After every test the ledger must still reconcile |
 | Unit tests (JUnit 5, Mockito, MockMvc) | Service rules, replay handling, ownership checks |
 
-See [`ConcurrencyIntegrationTest`](backend/src/test/java/com/smartbank/transaction/ConcurrencyIntegrationTest.java) and [`BankingIntegrationTest`](backend/src/test/java/com/smartbank/transaction/BankingIntegrationTest.java).
+See [`ConcurrencyIntegrationTest`](backend/src/test/java/com/smartbank/transaction/ConcurrencyIntegrationTest.java), [`LedgerIntegrationTest`](backend/src/test/java/com/smartbank/ledger/LedgerIntegrationTest.java) and [`LedgerMigrationTest`](backend/src/test/java/com/smartbank/ledger/LedgerMigrationTest.java).
+
+## How the ledger works
+
+| Transaction | Entries (signed; positive increases the ledger account) |
+| --- | --- |
+| Deposit 100 | `CUSTOMER(account) +100`, `EXTERNAL_CLEARING -100` |
+| Withdrawal 100 | `CUSTOMER(account) -100`, `EXTERNAL_CLEARING +100` |
+| Transfer 100 | `CUSTOMER(from) -100`, `CUSTOMER(to) +100` |
+| Opening balance 100 | `CUSTOMER(account) +100`, `OPENING_EQUITY -100` |
+
+`accounts.balance` is kept as a cached balance, because transfers lock the account row and check funds against it. The ledger is the record it must agree with, which [`LedgerReconciliation`](backend/src/main/java/com/smartbank/ledger/LedgerReconciliation.java) verifies. Balances that existed before the ledger (migration `V4`) were posted as opening balances dated before each account's first transaction.
+
+The external and equity sides are ledger accounts without a row in `accounts`, so deposits and withdrawals never lock a shared row and do not serialize on it.
 
 ## Tech stack
 
@@ -104,8 +120,9 @@ Sending the same command again with the same `requestKey` returns the same trans
 
 - `backend/src/main/java/com/smartbank/account`: accounts API, entity and locking repository
 - `backend/src/main/java/com/smartbank/transaction`: deposits, withdrawals, transfers, idempotency
+- `backend/src/main/java/com/smartbank/ledger`: ledger entries, posting accounts, reconciliation
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger)
 - `backend/src/test`: unit, integration and concurrency tests
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
@@ -115,7 +132,6 @@ Sending the same command again with the same `requestKey` returns the same trans
 Not implemented: refresh tokens or token revocation, rate limiting, MFA, account opening, audit logging, pagination beyond the newest 100 transactions, and cross-currency transfers. The demo password and JWT secret in `infra/compose.yml` are for local use only.
 
 Next steps:
-- Double-entry ledger: append-only debit/credit entries with balances derived from them.
 - Crash-recovery tests that kill the app or database mid-transfer and verify the books still balance.
 - Hot-account throughput benchmarks comparing pessimistic and optimistic locking.
 
