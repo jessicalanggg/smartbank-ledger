@@ -15,6 +15,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -41,6 +43,8 @@ class ConcurrencyIntegrationTest {
 
     @Autowired
     BankingService banking;
+    @Autowired
+    HoldService holds;
     @Autowired
     JdbcTemplate jdbc;
     @Autowired
@@ -195,6 +199,89 @@ class ConcurrencyIntegrationTest {
         assertEquals(2, (int) LedgerTestData.postedTransactionCount(jdbc));
         assertMoney("965.00", balance(account));
         assertLedgerClean();
+    }
+
+    @Test
+    void racingPostAndVoidOfTheSameHoldResolveItExactlyOnce() throws Exception {
+        UUID payer = accountIds.get(0), payee = accountIds.get(1);
+        List<UUID> holdIds = new ArrayList<>();
+        for (int i = 0; i < 20; i++)
+            holdIds.add(holds.create(new CreateHoldRequest(payer, payee, new BigDecimal("10.00"), "race-" + i, null)).id());
+        ConcurrentLinkedQueue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
+
+        List<Callable<Void>> work = new ArrayList<>();
+        for (UUID id : holdIds) {
+            for (int j = 0; j < 10; j++) {
+                work.add(() -> { try { holds.post(id, null); } catch (BankingException ignored) { } catch (Throwable t) { unexpected.add(t); } return null; });
+                work.add(() -> { try { holds.voidHold(id); } catch (BankingException ignored) { } catch (Throwable t) { unexpected.add(t); } return null; });
+            }
+        }
+        Collections.shuffle(work);
+        runConcurrently(work);
+
+        assertTrue(unexpected.isEmpty(), () -> "Unexpected failures: " + unexpected.stream().limit(5).toList());
+        int posted = 0;
+        for (UUID id : holdIds) {
+            HoldStatus status = holds.get(id).status();
+            assertTrue(status == HoldStatus.POSTED || status == HoldStatus.VOIDED, "Hold must be final: " + status);
+            if (status == HoldStatus.POSTED) posted++;
+        }
+        assertEquals(posted, (int) LedgerTestData.postedTransactionCount(jdbc), "One transfer per posted hold, none for voided");
+        assertMoney(new BigDecimal("1000.00").subtract(BigDecimal.TEN.multiply(BigDecimal.valueOf(posted))).toPlainString(), balance(payer));
+        assertLedgerClean();
+    }
+
+    @Test
+    void randomMixOfHoldsTransfersAndExpiryKeepsTheBooksExact() throws Exception {
+        BigDecimal totalBefore = totalBalance();
+        List<UUID> holdIds = Collections.synchronizedList(new ArrayList<>());
+        Map<String, AtomicInteger> outcomes = new ConcurrentHashMap<>();
+        ConcurrentLinkedQueue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
+        Instant farFuture = Instant.now().plus(Duration.ofDays(60));
+        int operations = 4_000;
+
+        List<Callable<Void>> work = new ArrayList<>();
+        for (int i = 0; i < operations; i++) {
+            int n = i;
+            work.add(() -> {
+                ThreadLocalRandom r = ThreadLocalRandom.current();
+                UUID a = accountIds.get(r.nextInt(ACCOUNTS));
+                UUID b;
+                do { b = accountIds.get(r.nextInt(ACCOUNTS)); } while (b.equals(a));
+                BigDecimal amount = BigDecimal.valueOf(r.nextInt(1, 20_001), 2);
+                int op = holdIds.isEmpty() ? 0 : r.nextInt(5);
+                String name = switch (op) { case 0 -> "hold"; case 1 -> "post"; case 2 -> "void"; case 3 -> "expire"; default -> "transfer"; };
+                try {
+                    switch (op) {
+                        case 0 -> holdIds.add(holds.create(new CreateHoldRequest(a, b, amount, "mix-" + n, null)).id());
+                        case 1 -> {
+                            UUID id = holdIds.get(r.nextInt(holdIds.size()));
+                            // Half full posts, half partial (possibly above the held amount, which must be rejected).
+                            holds.post(id, r.nextBoolean() ? null : amount);
+                        }
+                        case 2 -> holds.voidHold(holdIds.get(r.nextInt(holdIds.size())));
+                        case 3 -> holds.expire(holdIds.get(r.nextInt(holdIds.size())), farFuture);
+                        default -> banking.transfer(new TransferRequest(a, b, amount, "mix-t-" + n));
+                    }
+                    outcomes.computeIfAbsent(name + " ok", k -> new AtomicInteger()).incrementAndGet();
+                } catch (BankingException e) {
+                    outcomes.computeIfAbsent(name + " rejected", k -> new AtomicInteger()).incrementAndGet();
+                } catch (Throwable t) {
+                    unexpected.add(t);
+                }
+                return null;
+            });
+        }
+        long elapsedMs = runConcurrently(work);
+
+        assertTrue(unexpected.isEmpty(), () -> "Unexpected failures (deadlocks, constraint violations, etc.): "
+                + unexpected.stream().limit(5).map(Throwable::toString).toList());
+        assertEquals(0, totalBefore.compareTo(totalBalance()), "Holds never create or destroy money");
+        assertEquals(0, jdbc.queryForObject(
+                "SELECT COUNT(*) FROM accounts WHERE account_number LIKE 'CONC-%' AND balance - pending_debits < 0", Integer.class));
+        assertLedgerClean();
+        System.out.printf("[concurrency] %d mixed hold/transfer operations on %d threads in %d ms: %s, books reconciled%n",
+                operations, THREADS, elapsedMs, new TreeMap<>(outcomes));
     }
 
     /** Starts every task at the same instant and returns the wall-clock time taken. */

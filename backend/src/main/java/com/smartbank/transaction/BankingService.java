@@ -109,6 +109,16 @@ public class BankingService {
                 request.amount(), source.getCurrency(), request.requestKey());
     }
 
+    /** Two accounts locked in UUID order, the order every money-moving path uses. */
+    record LockedPair(Account source, Account target) { }
+
+    LockedPair lockPair(UUID sourceId, UUID targetId) {
+        boolean sourceFirst = sourceId.compareTo(targetId) < 0;
+        Account first = locked(sourceFirst ? sourceId : targetId);
+        Account second = locked(sourceFirst ? targetId : sourceId);
+        return sourceFirst ? new LockedPair(first, second) : new LockedPair(second, first);
+    }
+
     @Transactional(readOnly = true)
     public List<TransactionResponse> history(UUID accountId) {
         if (!accounts.existsById(accountId))
@@ -139,7 +149,7 @@ public class BankingService {
         return TransactionResponse.from(prior);
     }
 
-    private Account locked(UUID id) {
+    Account locked(UUID id) {
         return accounts.findLockedById(id).orElseThrow(() -> new AccountNotFoundException(id));
     }
 
@@ -147,7 +157,7 @@ public class BankingService {
      * Writes the transaction and its balanced ledger entries. Runs inside the
      * caller's transaction, so balances, transaction and entries commit together.
      */
-    private TransactionResponse record(TransactionType type, UUID from, UUID to,
+    TransactionResponse record(TransactionType type, UUID from, UUID to,
             BigDecimal amount, String currency, String key) {
         BankingTransaction tx = transactions.saveAndFlush(
                 new BankingTransaction(type, from, to, amount, currency, key));

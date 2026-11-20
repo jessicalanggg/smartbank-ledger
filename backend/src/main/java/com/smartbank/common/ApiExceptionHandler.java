@@ -4,6 +4,7 @@ import com.smartbank.account.AccountNotFoundException;
 import com.smartbank.auth.DuplicateEmailException;
 import org.springframework.security.authentication.BadCredentialsException;
 import com.smartbank.transaction.BankingException;
+import com.smartbank.transaction.HoldNotFoundException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
@@ -24,6 +25,10 @@ public class ApiExceptionHandler {
     @ExceptionHandler(AccountNotFoundException.class)
     public ProblemDetail notFound(AccountNotFoundException ex) {
         return problem(HttpStatus.NOT_FOUND, "Account not found", ex.getMessage());
+    }
+    @ExceptionHandler(HoldNotFoundException.class)
+    public ProblemDetail holdNotFound(HoldNotFoundException ex) {
+        return problem(HttpStatus.NOT_FOUND, "Hold not found", ex.getMessage());
     }
     @ExceptionHandler(BankingException.class)
     public ProblemDetail banking(BankingException ex) {

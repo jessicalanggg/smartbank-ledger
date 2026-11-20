@@ -8,7 +8,8 @@ import java.math.BigDecimal;
 
 /**
  * Checks the books: the ledger as a whole balances, every transaction balances,
- * and every cached account balance equals the sum of that account's entries.
+ * every cached account balance equals the sum of that account's entries, pending
+ * amounts equal the open holds, and every posted hold matches its transfer.
  * Runs in one REPEATABLE READ snapshot so concurrent postings cannot make a
  * consistent ledger look inconsistent.
  */
@@ -21,10 +22,12 @@ public class LedgerReconciliation {
     }
 
     public record Report(BigDecimal ledgerTotal, int unbalancedTransactions,
-                         int transactionsWithoutEntries, int accountsOutOfBalance) {
+                         int transactionsWithoutEntries, int accountsOutOfBalance,
+                         int accountsWithWrongPendingAmounts, int postedHoldsNotMatchingTransfer) {
         public boolean isClean() {
             return ledgerTotal.signum() == 0 && unbalancedTransactions == 0
-                    && transactionsWithoutEntries == 0 && accountsOutOfBalance == 0;
+                    && transactionsWithoutEntries == 0 && accountsOutOfBalance == 0
+                    && accountsWithWrongPendingAmounts == 0 && postedHoldsNotMatchingTransfer == 0;
         }
     }
 
@@ -47,6 +50,22 @@ public class LedgerReconciliation {
                            WHERE ledger_account = 'CUSTOMER' GROUP BY account_id) l
                        ON l.account_id = a.id
                 WHERE a.balance <> COALESCE(l.total, 0)""", Integer.class);
-        return new Report(total, unbalanced, withoutEntries, outOfBalance);
+        // Pending amounts on each account must equal the sum of its open holds.
+        Integer wrongPending = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM accounts a
+                WHERE a.pending_debits <> COALESCE((SELECT SUM(amount) FROM holds h
+                          WHERE h.status = 'PENDING' AND h.source_account_id = a.id), 0)
+                   OR a.pending_credits <> COALESCE((SELECT SUM(amount) FROM holds h
+                          WHERE h.status = 'PENDING' AND h.destination_account_id = a.id), 0)""",
+                Integer.class);
+        // Every posted hold produced exactly the transfer it describes.
+        Integer badPostings = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM holds h
+                LEFT JOIN banking_transactions t ON t.id = h.posted_transaction_id
+                WHERE h.status = 'POSTED'
+                  AND (t.id IS NULL OR t.transaction_type <> 'TRANSFER' OR t.amount <> h.posted_amount
+                       OR t.source_account_id <> h.source_account_id
+                       OR t.destination_account_id <> h.destination_account_id)""", Integer.class);
+        return new Report(total, unbalanced, withoutEntries, outOfBalance, wrongPending, badPostings);
     }
 }

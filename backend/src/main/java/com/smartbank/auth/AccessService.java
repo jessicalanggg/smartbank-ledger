@@ -20,4 +20,10 @@ public class AccessService {
         if (!accounts.existsByIdAndOwnerUserId(accountId, currentUserId()))
             throw new AccessDeniedException("Account access denied");
     }
+    public void requireOwnerOfAny(UUID... accountIds) {
+        UUID user = currentUserId();
+        for (UUID id : accountIds)
+            if (accounts.existsByIdAndOwnerUserId(id, user)) return;
+        throw new AccessDeniedException("Account access denied");
+    }
 }
