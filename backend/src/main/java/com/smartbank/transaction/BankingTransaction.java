@@ -25,7 +25,8 @@ public class BankingTransaction {
         this.id = UUID.randomUUID(); this.transactionType = type;
         this.sourceAccountId = source; this.destinationAccountId = destination;
         this.amount = amount; this.currency = currency; this.requestKey = requestKey;
-        this.createdAt = Instant.now();
+        // PostgreSQL stores microseconds; truncating here keeps the API response equal to what is stored.
+        this.createdAt = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS);
     }
     public UUID getId() { return id; }
     public TransactionType getTransactionType() { return transactionType; }

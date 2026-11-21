@@ -1,53 +1,72 @@
 package com.smartbank.transaction;
 
+import com.smartbank.auth.AccessService;
+import com.smartbank.idempotency.IdempotencyService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import java.util.List;
 import java.util.UUID;
 
+import static com.smartbank.idempotency.IdempotencyService.HEADER;
+import static com.smartbank.idempotency.IdempotencyService.fingerprint;
+
+/**
+ * Money-moving endpoints take an idempotency key from the Idempotency-Key header
+ * (or the requestKey body field). Ownership is checked first, so an unauthorized
+ * attempt never consumes a key.
+ */
 @RestController
 @RequestMapping("/api/v1")
 public class BankingController {
     private final BankingService service;
-    private final com.smartbank.auth.AccessService access;
+    private final AccessService access;
+    private final IdempotencyService idempotency;
 
-    public BankingController(BankingService service, com.smartbank.auth.AccessService access) {
+    public BankingController(BankingService service, AccessService access, IdempotencyService idempotency) {
         this.service = service;
         this.access = access;
+        this.idempotency = idempotency;
     }
 
     @PostMapping("/accounts/{id}/deposits")
-    @ResponseStatus(HttpStatus.CREATED)
-    public TransactionResponse deposit(@PathVariable UUID id, @Valid @RequestBody MoneyRequest request) {
+    public ResponseEntity<String> deposit(@PathVariable UUID id, @Valid @RequestBody MoneyRequest request,
+                                          @RequestHeader(value = HEADER, required = false) String key) {
         access.requireOwner(id);
-        return service.deposit(id, request);
+        return idempotency.execute(key, request.requestKey(), fingerprint("deposit", id, request.amount()),
+                HttpStatus.CREATED, op -> service.deposit(id, new MoneyRequest(request.amount(), op)));
     }
 
     @PostMapping("/accounts/{id}/withdrawals")
-    @ResponseStatus(HttpStatus.CREATED)
-    public TransactionResponse withdraw(@PathVariable UUID id, @Valid @RequestBody MoneyRequest request) {
+    public ResponseEntity<String> withdraw(@PathVariable UUID id, @Valid @RequestBody MoneyRequest request,
+                                           @RequestHeader(value = HEADER, required = false) String key) {
         access.requireOwner(id);
-        return service.withdraw(id, request);
+        return idempotency.execute(key, request.requestKey(), fingerprint("withdrawal", id, request.amount()),
+                HttpStatus.CREATED, op -> service.withdraw(id, new MoneyRequest(request.amount(), op)));
     }
 
     @PostMapping("/transfers")
-    @ResponseStatus(HttpStatus.CREATED)
-    public TransactionResponse transfer(@Valid @RequestBody TransferRequest request) {
+    public ResponseEntity<String> transfer(@Valid @RequestBody TransferRequest request,
+                                           @RequestHeader(value = HEADER, required = false) String key) {
         access.requireOwner(request.fromAccountId());
-        return service.transfer(request);
+        return idempotency.execute(key, request.requestKey(),
+                fingerprint("transfer", request.fromAccountId(), request.toAccountId(), request.amount()),
+                HttpStatus.CREATED, op -> service.transfer(new TransferRequest(
+                        request.fromAccountId(), request.toAccountId(), request.amount(), op)));
     }
 
     @PostMapping("/transfers/by-account-number")
-    @ResponseStatus(HttpStatus.CREATED)
-    public TransactionResponse transferByAccountNumber(
-            @Valid @RequestBody TransferByAccountNumberRequest request) {
-
+    public ResponseEntity<String> transferByAccountNumber(@Valid @RequestBody TransferByAccountNumberRequest request,
+                                                          @RequestHeader(value = HEADER, required = false) String key) {
         access.requireOwner(request.fromAccountId());
-        return service.transferByAccountNumber(request);
+        String toAccountNumber = request.toAccountNumber().trim();
+        return idempotency.execute(key, request.requestKey(),
+                fingerprint("transfer-by-number", request.fromAccountId(), toAccountNumber, request.amount()),
+                HttpStatus.CREATED, op -> service.transferByAccountNumber(new TransferByAccountNumberRequest(
+                        request.fromAccountId(), toAccountNumber, request.amount(), op)));
     }
 
-    // Existing transaction history endpoint
     @GetMapping("/accounts/{id}/transactions")
     public List<TransactionResponse> history(@PathVariable UUID id) {
         access.requireOwner(id);

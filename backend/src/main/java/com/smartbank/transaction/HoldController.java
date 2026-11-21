@@ -1,8 +1,10 @@
 package com.smartbank.transaction;
 
 import com.smartbank.auth.AccessService;
+import com.smartbank.idempotency.IdempotencyService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import java.util.List;
 import java.util.UUID;
@@ -17,17 +19,24 @@ import java.util.UUID;
 public class HoldController {
     private final HoldService holds;
     private final AccessService access;
+    private final IdempotencyService idempotency;
 
-    public HoldController(HoldService holds, AccessService access) {
+    public HoldController(HoldService holds, AccessService access, IdempotencyService idempotency) {
         this.holds = holds;
         this.access = access;
+        this.idempotency = idempotency;
     }
 
+    /** Idempotent by the Idempotency-Key header or requestKey field, scoped to the caller. */
     @PostMapping("/holds")
-    @ResponseStatus(HttpStatus.CREATED)
-    public HoldResponse create(@Valid @RequestBody CreateHoldRequest request) {
+    public ResponseEntity<String> create(@Valid @RequestBody CreateHoldRequest request,
+                                         @RequestHeader(value = IdempotencyService.HEADER, required = false) String key) {
         access.requireOwner(request.fromAccountId());
-        return holds.create(request);
+        long ttl = request.expiresInSeconds() == null ? HoldService.DEFAULT_TTL.toSeconds() : request.expiresInSeconds();
+        return idempotency.execute(key, request.requestKey(),
+                IdempotencyService.fingerprint("hold", request.fromAccountId(), request.toAccountId(), request.amount(), ttl),
+                HttpStatus.CREATED, op -> holds.create(new CreateHoldRequest(
+                        request.fromAccountId(), request.toAccountId(), request.amount(), op, request.expiresInSeconds())));
     }
 
     @GetMapping("/holds/{id}")

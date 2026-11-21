@@ -35,6 +35,8 @@ public class HoldService {
 
     @Transactional
     public HoldResponse create(CreateHoldRequest request) {
+        if (request.requestKey() == null || request.requestKey().isBlank())
+            throw new IllegalArgumentException("A request key is required");
         if (request.fromAccountId().equals(request.toAccountId()))
             throw new BankingException("Source and destination must differ");
         var previous = holds.findByRequestKey(request.requestKey());
@@ -50,7 +52,7 @@ public class HoldService {
             throw new BankingException("Cross-currency holds are not supported");
         source.reserveDebit(request.amount());
         target.reserveCredit(request.amount());
-        Instant now = clock.instant();
+        Instant now = now();
         Duration ttl = request.expiresInSeconds() == null
                 ? DEFAULT_TTL : Duration.ofSeconds(request.expiresInSeconds());
         return HoldResponse.from(holds.saveAndFlush(new Hold(source.getId(), target.getId(), request.amount(),
@@ -74,7 +76,7 @@ public class HoldService {
         if (amount.compareTo(hold.getAmount()) > 0)
             throw new BankingException("Cannot post more than the held amount");
         var accounts = banking.lockPair(hold.getSourceAccountId(), hold.getDestinationAccountId());
-        Instant now = clock.instant();
+        Instant now = now();
         if (hold.isExpiredAt(now)) {
             // Commit the expiry (noRollbackFor) so the reservation is released either way.
             release(hold, accounts);
@@ -102,7 +104,7 @@ public class HoldService {
         }
         var accounts = banking.lockPair(hold.getSourceAccountId(), hold.getDestinationAccountId());
         release(hold, accounts);
-        hold.markVoided(clock.instant());
+        hold.markVoided(now());
         holds.flush();
         return HoldResponse.from(hold);
     }
@@ -132,6 +134,11 @@ public class HoldService {
     @Transactional(readOnly = true)
     public List<HoldResponse> forAccount(UUID accountId) {
         return holds.findForAccount(accountId, PageRequest.of(0, 100)).stream().map(HoldResponse::from).toList();
+    }
+
+    /** Current time at PostgreSQL's microsecond precision, so responses equal what is stored. */
+    private Instant now() {
+        return clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS);
     }
 
     private Hold lockedHold(UUID holdId) {

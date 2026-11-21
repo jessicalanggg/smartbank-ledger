@@ -5,6 +5,8 @@ import com.smartbank.auth.DuplicateEmailException;
 import org.springframework.security.authentication.BadCredentialsException;
 import com.smartbank.transaction.BankingException;
 import com.smartbank.transaction.HoldNotFoundException;
+import com.smartbank.idempotency.IdempotencyKeyMismatchException;
+import com.smartbank.idempotency.InvalidIdempotencyKeyException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
@@ -25,6 +27,14 @@ public class ApiExceptionHandler {
     @ExceptionHandler(AccountNotFoundException.class)
     public ProblemDetail notFound(AccountNotFoundException ex) {
         return problem(HttpStatus.NOT_FOUND, "Account not found", ex.getMessage());
+    }
+    @ExceptionHandler(IdempotencyKeyMismatchException.class)
+    public ProblemDetail idempotencyMismatch(IdempotencyKeyMismatchException ex) {
+        return problem(HttpStatus.UNPROCESSABLE_ENTITY, "Idempotency key reused", ex.getMessage());
+    }
+    @ExceptionHandler(InvalidIdempotencyKeyException.class)
+    public ProblemDetail invalidIdempotencyKey(InvalidIdempotencyKeyException ex) {
+        return problem(HttpStatus.BAD_REQUEST, "Invalid idempotency key", ex.getMessage());
     }
     @ExceptionHandler(HoldNotFoundException.class)
     public ProblemDetail holdNotFound(HoldNotFoundException ex) {

@@ -79,6 +79,8 @@ public class BankingService {
     private TransactionResponse idempotent(String requestKey,
             Function<BankingTransaction, TransactionResponse> replay,
             Supplier<TransactionResponse> post) {
+        if (requestKey == null || requestKey.isBlank())
+            throw new IllegalArgumentException("A request key is required");
         var previous = transactions.findByRequestKey(requestKey);
         if (previous.isPresent())
             return replay.apply(previous.get());
