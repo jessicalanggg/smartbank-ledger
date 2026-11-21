@@ -155,9 +155,27 @@ Batches form on their own: while a worker posts one batch, new requests queue fo
 
 **Scope.** Only transfers (including by account number) are batched. Deposits, withdrawals, linked transfers and holds still post one at a time.
 
+## Short locks for holds
+
+Holds used to lock both accounts first and keep them locked while writing the hold, the transfer, the ledger entries and the event. They now follow the same rule as transfers ([`HoldService`](../backend/src/main/java/com/smartbank/transaction/HoldService.java)):
+
+- **Create:** read the accounts without locking, insert the hold and its event, then reserve the money last with one conditional statement per account; the payer's only applies if its available balance covers the hold. A simultaneous identical request waits on the hold's unique request key and is replayed.
+- **Post, void, expire:** lock the hold row (only requests for the same hold contend on it), write the transfer, the hold's new state and the event, then apply both accounts' changes (posted balance and pending amounts together) in one batch at the very end.
+
+All account changes now go through one statement, `UPDATE accounts SET balance = balance + ?, pending_debits = pending_debits + ?, pending_credits = pending_credits + ? … WHERE id = ? AND available balance afterwards >= 0`, so the Java `Account` entity no longer changes balances at all.
+
+**Results.** `-Dbenchmark.mode=holds`: each operation creates a hold and posts it. Interleaved runs (before, after, before, after), 2,000 operations per row, 32 threads; machine load rose from about 4 to 9 during the runs.
+
+| Holds into hot account | Before: ops/s | After: ops/s | Before: p99 ms | After: p99 ms |
+| --- | --- | --- | --- | --- |
+| 0% | 242 / 215 | 344 / 335 | 794 / 700 | 272 / 314 |
+| 50% | 238 / 240 | 299 / 455 | 1,459 / 1,752 | 400 / 253 |
+| 100% | 173 / 169 | 268 / 167 | 2,756 / 3,206 | 422 / 1,003 |
+
+Throughput rose about 40–90% where it moved (the second all-hot run was flat), and p99 latency fell 2.5–7× in every row. Holds are not batched, so they stay well below batched transfers; each operation is also two transactions.
+
 ## Possible next steps
 
-- Lock a hold's two accounts with one `SELECT … ORDER BY id FOR NO KEY UPDATE` (needs the Java lock order changed to PostgreSQL's unsigned UUID order everywhere).
 - The same short-critical-section design for the hold path.
 - Batch deposits, withdrawals and linked transfers too.
 - For accounts hotter than one batch per commit can serve, split the balance into several sub-balance rows, or apply credits asynchronously (safe for incoming money because the cached balance can only lag low).

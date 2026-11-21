@@ -85,7 +85,7 @@ PENDING ──post (full or partial)──▶ POSTED    money moves through the 
 - Creating a hold raises the payer's `pendingDebits` and the payee's `pendingCredits`. **Available balance** = `balance - pendingDebits`, and every withdrawal, transfer and new hold is checked against it.
 - A hold changes state exactly once. A database trigger rejects any other update and any delete.
 - Retrying is safe: creating a hold is idempotent by `requestKey`; repeating a post with the same amount, or a void, returns the hold unchanged; anything conflicting returns 409.
-- Every path locks the hold first, then both accounts in UUID order, so holds, transfers and the expiry job cannot deadlock with each other.
+- Account locks are taken last: creating a hold inserts it and its event first and reserves the money in one final conditional statement per account; posting, voiding and expiring lock only the hold row, write everything, then change both accounts in one batch. With every path locking accounts last and in the same order, holds, transfers and the expiry job cannot deadlock with each other.
 - Reconciliation also checks that each account's pending amounts equal its open holds and that every posted hold matches its transfer.
 
 ## How linked transfers work
@@ -222,7 +222,7 @@ Sending the same command again with the same `$KEY` returns the identical respon
 Not implemented: refresh tokens or token revocation, MFA, account opening, audit logging, pagination beyond the newest 100 transactions, and cross-currency transfers. The demo password, JWT secret and webhook encryption key in `infra/compose.yml` are for local use only, and Compose allows http and private webhook targets so a receiver on your machine works; production must set `WEBHOOK_ENCRYPTION_KEY` and leave `WEBHOOK_ALLOW_HTTP` and `WEBHOOK_ALLOW_PRIVATE_TARGETS` off.
 
 Next steps:
-- Re-run the throughput benchmark on a quiet machine after the round-trip and outbox changes, and apply the short-lock design to holds.
+- Re-run the throughput benchmarks on a quiet machine.
 - Close the remaining DNS-rebinding window for webhooks with an egress proxy, and allow rotating the secret-encryption key.
 - Holds in the frontend (the API and tests are complete; the UI does not show holds yet).
 
