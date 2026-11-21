@@ -9,6 +9,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Accounts, deposits, withdrawals and transfers** through a versioned REST API (`/api/v1`), with transaction history per account.
 - **Double-entry ledger.** Every transaction posts balanced, append-only ledger entries: a transfer debits one customer account and credits another; a deposit or withdrawal posts against an `EXTERNAL_CLEARING` account. PostgreSQL rejects at commit any transaction whose entries do not sum to zero, and rejects any `UPDATE` or `DELETE` of entries or transactions. A reconciliation check proves every cached account balance equals the sum of its entries.
 - **Two-phase transfers (holds).** A payer places a hold that reserves money without moving it, the way a card authorization does. The payee then posts it (in full or in part, releasing the rest) or voids it, and unposted holds expire automatically. Each account reports a posted balance, an available balance and pending amounts, and PostgreSQL rejects any change that would make the available balance negative.
+- **Transactional outbox and signed webhooks.** Every posting and hold change writes an event in the same database transaction, so an event exists if and only if its change committed. A worker delivers events to subscribed endpoints with HMAC-SHA256 signatures, at least once, with exponential backoff, a dead-letter state, and `SKIP LOCKED` leases so several instances can deliver safely. See [docs/webhooks.md](docs/webhooks.md).
 - **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
 - **Idempotency keys, scoped per user.** Every deposit, withdrawal, transfer and hold takes an `Idempotency-Key` header (or the `requestKey` body field). The first response, success or business error, is stored and replayed byte-for-byte for retries, marked `Idempotent-Replayed: true`, even when many retries arrive at once. Reusing a key for a different request returns 422. Keys are scoped to the calling user and expire after 24 hours. Posting stays exactly-once even if the server stops between posting and storing the response.
 - **Short, deadlock-free locking.** A transfer writes its transaction and ledger entries first, then updates both balances last with atomic statements in UUID order (the debit only succeeds if available funds cover it). Account locks are held only for those final statements and the commit, and opposing transfers (A→B and B→A) cannot deadlock.
@@ -31,6 +32,7 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | 10 posts racing 10 voids on each of 20 holds | Every hold ends posted or voided, never both; one transfer per posted hold |
 | Hold tests | Reservation, full and partial posting, voids, expiry (including a post that arrives after expiry), idempotency, and database rules on hold state changes |
 | Idempotency API tests | Byte-identical replays, per-user scoping, 422 on a different request, stored business errors, keys not consumed by 403/400, expiry and pruning, recovery when the response was never stored, 30 simultaneous retries posting once |
+| Webhook tests (real HTTP receiver) | Events only for committed changes; routing to payer and payee only; signatures verify and reject tampering; retries on schedule; dead-lettering; timeouts; expired leases; 6 concurrent workers deliver 120 events exactly once |
 | Hold API tests (real JWT security) | Only the payer can place a hold, only the payee can post or void it, only the two parties can see it |
 | Ledger tests | Each operation posts the right balanced entries; unbalanced postings, transactions without entries, and edits or deletes of history are rejected by PostgreSQL; reconciliation detects a balance changed outside the ledger |
 | Model-based randomized test | 4,800 random operations per run (transfers, retries, key conflicts, holds, posts, voids, expiry) match an independent model after every step; failures shrink to a minimal reproduction with a seed |
@@ -149,6 +151,10 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `POST` | `/api/v1/holds/{id}/post` | Optional `{ "amount" }` for a partial post. Payee only |
 | `POST` | `/api/v1/holds/{id}/void` | Payee only |
 | `GET` | `/api/v1/accounts/{id}/holds` | Holds in or out of the account, newest 100, owner only |
+| `POST` | `/api/v1/webhook-endpoints` | `{ "url", "eventTypes"? }`. Returns the signing secret once |
+| `GET` | `/api/v1/webhook-endpoints` | The caller's endpoints |
+| `DELETE` | `/api/v1/webhook-endpoints/{id}` | Deactivate |
+| `GET` | `/api/v1/webhook-endpoints/{id}/deliveries` | Delivery status, attempts and errors |
 
 Account responses include `balance` (posted), `availableBalance`, `pendingDebits` and `pendingCredits`.
 
@@ -173,9 +179,10 @@ Sending the same command again with the same `$KEY` returns the identical respon
 - `backend/src/main/java/com/smartbank/account`: accounts API, entity and locking repository
 - `backend/src/main/java/com/smartbank/transaction`: deposits, withdrawals, transfers, holds, idempotency
 - `backend/src/main/java/com/smartbank/ledger`: ledger entries, posting accounts, reconciliation
+- `backend/src/main/java/com/smartbank/events`: outbox, webhook endpoints, signed delivery worker
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
@@ -186,7 +193,7 @@ Not implemented: refresh tokens or token revocation, rate limiting, MFA, account
 
 Next steps:
 - Fewer round trips per transfer to raise the overall throughput ceiling, and the short-lock design for holds.
-- Transactional outbox with signed webhooks for posted, voided and expired events.
+- Webhook hardening: SSRF protection, encrypted secrets with rotation, a replay API for dead-lettered deliveries.
 - Holds in the frontend (the API and tests are complete; the UI does not show holds yet).
 
 Development history by sprint: [Sprint 2](SPRINT2_README.md) (transactions), [Sprint 3](SPRINT3_README.md) (authentication), [frontend](frontend/README.md).

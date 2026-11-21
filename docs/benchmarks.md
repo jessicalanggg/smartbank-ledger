@@ -75,6 +75,10 @@ Same settings as the baseline: 3,000 transfers per run, 32 client threads, pool 
 - Throughput with no hot account is unchanged (≈600 transfers/s), but its p99 fell from ≈480 ms to under 200 ms because transfers no longer queue behind each other's whole-transaction locks. Median latency at low contention rose (≈15 → ≈40 ms) as requests now share the connection pool more evenly instead of some finishing quickly while others wait seconds.
 - The remaining ceiling of ≈600 transfers/s is not hot-account locking. It is consistent across hot shares, and it was not investigated further; candidates are the round-trip count per transfer (≈5 ms of service time) and the Docker Desktop network path.
 
+## After the transactional outbox
+
+The outbox adds two SQL statements to every posting (the event and its delivery rows), both before the account-lock window. An interleaved A/B run (before, after, before, after) was taken while the machine was under heavy unrelated load (load average ≈ 15 on 10 cores); the noise exceeded any difference, with the pre-outbox code slower in both pairs. The effect is not yet quantified and should be re-measured on a quiet machine.
+
 ## Possible next steps
 
 - Fewer round trips per transfer (JDBC batching, one statement for the idempotency check and insert) to raise the overall ceiling.
