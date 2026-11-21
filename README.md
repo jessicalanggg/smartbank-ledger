@@ -10,7 +10,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Double-entry ledger.** Every transaction posts balanced, append-only ledger entries: a transfer debits one customer account and credits another; a deposit or withdrawal posts against an `EXTERNAL_CLEARING` account. PostgreSQL rejects at commit any transaction whose entries do not sum to zero, and rejects any `UPDATE` or `DELETE` of entries or transactions. A reconciliation check proves every cached account balance equals the sum of its entries.
 - **Two-phase transfers (holds).** A payer places a hold that reserves money without moving it, the way a card authorization does. The payee then posts it (in full or in part, releasing the rest) or voids it, and unposted holds expire automatically. Each account reports a posted balance, an available balance and pending amounts, and PostgreSQL rejects any change that would make the available balance negative.
 - **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
-- **Idempotent requests.** Every deposit, withdrawal and transfer carries a client-generated `requestKey`. A retry with the same key returns the original transaction instead of posting again, even when many retries arrive at the same moment. Reusing a key for a different operation returns HTTP 409.
+- **Idempotency keys, scoped per user.** Every deposit, withdrawal, transfer and hold takes an `Idempotency-Key` header (or the `requestKey` body field). The first response, success or business error, is stored and replayed byte-for-byte for retries, marked `Idempotent-Replayed: true`, even when many retries arrive at once. Reusing a key for a different request returns 422. Keys are scoped to the calling user and expire after 24 hours. Posting stays exactly-once even if the server stops between posting and storing the response.
 - **Short, deadlock-free locking.** A transfer writes its transaction and ledger entries first, then updates both balances last with atomic statements in UUID order (the debit only succeeds if available funds cover it). Account locks are held only for those final statements and the commit, and opposing transfers (A→B and B→A) cannot deadlock.
 - **Benchmarked hot-account throughput.** When every transfer pays one account, this design sustains about 2.6× the throughput of locking both accounts for the whole transfer, with about 10× lower p99 latency (≈540 vs ≈200 transfers/s, p99 under 300 ms vs ≈3 s). See [docs/benchmarks.md](docs/benchmarks.md).
 - **Authentication and authorization.** Spring Security with stateless JWT (HS256, 30-minute expiry) and BCrypt password hashing. Users can only read, debit or view the history of accounts they own.
@@ -30,6 +30,7 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | 4,000 random holds, posts, voids, expiries and transfers (32 threads) | No deadlocks, no money created or lost, available balances never negative, pending amounts and posted holds reconcile |
 | 10 posts racing 10 voids on each of 20 holds | Every hold ends posted or voided, never both; one transfer per posted hold |
 | Hold tests | Reservation, full and partial posting, voids, expiry (including a post that arrives after expiry), idempotency, and database rules on hold state changes |
+| Idempotency API tests | Byte-identical replays, per-user scoping, 422 on a different request, stored business errors, keys not consumed by 403/400, expiry and pruning, recovery when the response was never stored, 30 simultaneous retries posting once |
 | Hold API tests (real JWT security) | Only the payer can place a hold, only the payee can post or void it, only the two parties can see it |
 | Ledger tests | Each operation posts the right balanced entries; unbalanced postings, transactions without entries, and edits or deletes of history are rejected by PostgreSQL; reconciliation detects a balance changed outside the ledger |
 | Model-based randomized test | 4,800 random operations per run (transfers, retries, key conflicts, holds, posts, voids, expiry) match an independent model after every step; failures shrink to a minimal reproduction with a seed |
@@ -73,6 +74,20 @@ PENDING ──post (full or partial)──▶ POSTED    money moves through the 
 - Every path locks the hold first, then both accounts in UUID order, so holds, transfers and the expiry job cannot deadlock with each other.
 - Reconciliation also checks that each account's pending amounts equal its open holds and that every posted hold matches its transfer.
 
+## How idempotency keys work
+
+```
+POST + Idempotency-Key ─▶ claim (user, key) ─┬─ completed ──────────▶ replay stored status + body (Idempotent-Replayed: true)
+                                             ├─ different request ──▶ 422
+                                             └─ new or unfinished ──▶ run with the key's operation key ─▶ store response ─▶ return it
+```
+
+- Each (user, key) maps to a server-generated **operation key**, which the ledger stores under a `UNIQUE` constraint. The response is stored in a separate step; if the server stops in between, the retry runs the same operation key, gets the original transaction back, and stores that.
+- Stored: successes and business rejections (409 such as insufficient funds, 404). Not stored, so a retry runs again: validation errors (400), authorization failures (403, checked before the key is claimed), and unexpected errors.
+- Requests are compared by a SHA-256 fingerprint of the operation and its parameters, with amounts normalized (`25` and `25.00` are the same request).
+- Keys expire after 24 hours (`smartbank.idempotency.retention`) and an hourly job prunes them. After expiry the key can be used for a new request.
+- Posting and voiding a hold are idempotent through the hold's own state, so they take no key.
+
 ## Tech stack
 
 Java 21, Spring Boot 3.5, Spring Data JPA, Spring Security (OAuth2 resource server, JWT), PostgreSQL 17, Flyway, Testcontainers, Toxiproxy, JUnit 5, Mockito, React 19, TypeScript, Vite, Docker Compose, GitHub Actions.
@@ -115,7 +130,7 @@ CI runs `mvn verify` on every push and pull request. The hot-account benchmark i
 
 ## API
 
-All endpoints except health, login and register need `Authorization: Bearer <token>`.
+All endpoints except health, login and register need `Authorization: Bearer <token>`. Money-moving `POST`s (deposits, withdrawals, transfers, holds) also need an `Idempotency-Key` header, or a `requestKey` body field, of up to 255 characters.
 
 | Method | Path | Notes |
 | --- | --- | --- |
@@ -124,12 +139,12 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `POST` | `/api/v1/auth/login` | Public. Returns `accessToken` |
 | `GET` | `/api/v1/accounts` | Accounts owned by the caller |
 | `GET` | `/api/v1/accounts/{id}` | Owner only |
-| `POST` | `/api/v1/accounts/{id}/deposits` | `{ "amount": "100.00", "requestKey": "<uuid>" }` |
-| `POST` | `/api/v1/accounts/{id}/withdrawals` | `{ "amount": "25.00", "requestKey": "<uuid>" }` |
-| `POST` | `/api/v1/transfers` | `{ "fromAccountId", "toAccountId", "amount", "requestKey" }`. Caller must own the source |
-| `POST` | `/api/v1/transfers/by-account-number` | `{ "fromAccountId", "toAccountNumber", "amount", "requestKey" }` |
+| `POST` | `/api/v1/accounts/{id}/deposits` | `{ "amount": "100.00" }` |
+| `POST` | `/api/v1/accounts/{id}/withdrawals` | `{ "amount": "25.00" }` |
+| `POST` | `/api/v1/transfers` | `{ "fromAccountId", "toAccountId", "amount" }`. Caller must own the source |
+| `POST` | `/api/v1/transfers/by-account-number` | `{ "fromAccountId", "toAccountNumber", "amount" }` |
 | `GET` | `/api/v1/accounts/{id}/transactions` | Newest 100, owner only |
-| `POST` | `/api/v1/holds` | `{ "fromAccountId", "toAccountId", "amount", "requestKey", "expiresInSeconds"? }`. Caller must own the source |
+| `POST` | `/api/v1/holds` | `{ "fromAccountId", "toAccountId", "amount", "expiresInSeconds"? }`. Caller must own the source |
 | `GET` | `/api/v1/holds/{id}` | Payer or payee only |
 | `POST` | `/api/v1/holds/{id}/post` | Optional `{ "amount" }` for a partial post. Payee only |
 | `POST` | `/api/v1/holds/{id}/void` | Payee only |
@@ -137,7 +152,7 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 
 Account responses include `balance` (posted), `availableBalance`, `pendingDebits` and `pendingCredits`.
 
-Errors use RFC 9457 problem details: 400 invalid input, 401 bad credentials, 403 not the owner, 404 unknown account or hold, 409 insufficient funds, conflicting key reuse, a hold that is already final or expired, or another business rule.
+Errors use RFC 9457 problem details: 400 invalid input or a missing idempotency key, 422 an idempotency key reused for a different request, 401 bad credentials, 403 not the owner, 404 unknown account or hold, 409 insufficient funds, conflicting key reuse, a hold that is already final or expired, or another business rule.
 
 Example:
 
@@ -145,19 +160,22 @@ Example:
 TOKEN=$(curl -s localhost:8081/api/v1/auth/login -H 'Content-Type: application/json' \
   -d '{"email":"demo.a@smartbank.local","password":"<demo password>"}' | jq -r .accessToken)
 
-curl -s localhost:8081/api/v1/transfers -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d "{\"fromAccountId\":\"11111111-1111-4111-8111-111111111111\",\"toAccountId\":\"22222222-2222-4222-8222-222222222222\",\"amount\":\"10.00\",\"requestKey\":\"$(uuidgen)\"}"
+KEY=$(uuidgen)
+curl -si localhost:8081/api/v1/transfers -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"fromAccountId":"11111111-1111-4111-8111-111111111111","toAccountId":"22222222-2222-4222-8222-222222222222","amount":"10.00"}'
 ```
 
-Sending the same command again with the same `requestKey` returns the same transaction and does not move money twice.
+Sending the same command again with the same `$KEY` returns the identical response with `Idempotent-Replayed: true` and does not move money twice.
 
 ## Project layout
 
 - `backend/src/main/java/com/smartbank/account`: accounts API, entity and locking repository
 - `backend/src/main/java/com/smartbank/transaction`: deposits, withdrawals, transfers, holds, idempotency
 - `backend/src/main/java/com/smartbank/ledger`: ledger entries, posting accounts, reconciliation
+- `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
@@ -168,7 +186,6 @@ Not implemented: refresh tokens or token revocation, rate limiting, MFA, account
 
 Next steps:
 - Fewer round trips per transfer to raise the overall throughput ceiling, and the short-lock design for holds.
-- Idempotency keys scoped per user with expiry, replaying the original response.
 - Transactional outbox with signed webhooks for posted, voided and expired events.
 - Holds in the frontend (the API and tests are complete; the UI does not show holds yet).
 
