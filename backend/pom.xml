@@ -32,6 +32,12 @@
       <artifactId>postgresql</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Network fault injection between the app and PostgreSQL -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>toxiproxy</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
   <build>
     <plugins>
