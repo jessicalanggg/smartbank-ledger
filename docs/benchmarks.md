@@ -124,7 +124,7 @@ All 84 tests pass with the new write path, including the model-based test and th
 
 ## Batched posting (group commit)
 
-[`TransferBatcher`](../backend/src/main/java/com/smartbank/transaction/TransferBatcher.java) queues concurrent transfer requests. A worker takes everything queued (up to 200) and posts it in one database transaction:
+[`PostingBatcher`](../backend/src/main/java/com/smartbank/transaction/PostingBatcher.java) queues concurrent transfer, deposit and withdrawal requests. A worker takes everything queued (up to 200) and posts it in one database transaction:
 
 1. Look up every request key in one query; committed ones are replayed.
 2. Lock every account the batch touches with one `SELECT … WHERE id IN (…) ORDER BY id FOR NO KEY UPDATE`.
@@ -153,7 +153,21 @@ Batches form on their own: while a worker posts one batch, new requests queue fo
 
 **Verified** by the full suite running through the batcher (97 tests): the model-based test, network-cut and `kill -9` crash tests, the 5,000-transfer and mixed hold/transfer concurrency tests, and batch tests for isolation of a rejected transfer, arrival-order decisions, duplicate keys inside a batch, replays, and the deadlock case above.
 
-**Scope.** Only transfers (including by account number) are batched. Deposits, withdrawals, linked transfers and holds still post one at a time.
+**Scope.** Transfers (including by account number), deposits and withdrawals are batched, together in the same batches. Linked transfers, reversals and holds still post one at a time.
+
+### Deposits and withdrawals
+
+Deposits and withdrawals join the same batches as transfers and are decided by the same rules as on their own: a deposit needs its account to exist, a withdrawal needs available funds, and both are decided in arrival order, so a withdrawal can use money deposited earlier in the same batch. Request keys are shared across the three types inside a batch, so a deposit key reused for a withdrawal is rejected there too.
+
+`-Dbenchmark.mode=deposits`, interleaved (off, on, off, on), 3,000 deposits per row, 32 threads; machine load 4.5–10:
+
+| Deposits into hot account | Off: deposits/s | On: deposits/s | Off: p99 ms | On: p99 ms |
+| --- | --- | --- | --- | --- |
+| 0% | 511 / 432 | 1,691 / 1,640 | 317 / 415 | 47 / 60 |
+| 50% | 605 / 654 | 2,855 / 1,726 | 192 / 213 | 27 / 47 |
+| 100% | 696 / 593 | 1,296 / 2,289 | 206 / 251 | 412 / 39 |
+
+About 2–5× the throughput, and p99 4–9× lower in five of six pairs; the first all-hot batched run had one slow tail (412 ms).
 
 ## Short locks for holds
 
@@ -177,5 +191,5 @@ Throughput rose about 40–90% where it moved (the second all-hot run was flat),
 ## Possible next steps
 
 - The same short-critical-section design for the hold path.
-- Batch deposits, withdrawals and linked transfers too.
+- Batch linked transfers too.
 - For accounts hotter than one batch per commit can serve, split the balance into several sub-balance rows, or apply credits asynchronously (safe for incoming money because the cached balance can only lag low).
