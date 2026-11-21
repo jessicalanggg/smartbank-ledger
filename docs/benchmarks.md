@@ -122,8 +122,42 @@ All 84 tests pass with the new write path, including the model-based test and th
 
 **Throughput not re-measured.** The machine was under heavy unrelated load (load average ≈ 11 on 10 cores) when this was done, which makes throughput numbers unreliable. With the service time now dominated by about 6 instead of 17 round trips, the benchmark above should be re-run on a quiet machine.
 
+## Batched posting (group commit)
+
+[`TransferBatcher`](../backend/src/main/java/com/smartbank/transaction/TransferBatcher.java) queues concurrent transfer requests. A worker takes everything queued (up to 200) and posts it in one database transaction:
+
+1. Look up every request key in one query; committed ones are replayed.
+2. Lock every account the batch touches with one `SELECT … WHERE id IN (…) ORDER BY id FOR NO KEY UPDATE`.
+3. Decide each transfer in arrival order against the locked balances, exactly as if they ran one after another. A rejected transfer (insufficient funds, unknown account, different currencies) gets its own error; the rest of the batch still posts.
+4. Write all accepted transfers, with ledger entries, events and webhook deliveries, in one statement, and each account's net balance change in one batch.
+5. Commit, then answer every caller. Nobody hears "success" before the commit.
+
+Batches form on their own: while a worker posts one batch, new requests queue for the next. Under light load a batch is one transfer; under load it grows (2,000 concurrent transfers into one account averaged about 12 per batch). Settings: `smartbank.batching.enabled` (true), `workers` (2), `max-size` (200), `linger` (0 ms).
+
+**Lock order.** The batch locks accounts in PostgreSQL's `ORDER BY id` order, which is unsigned byte order. Java's `UUID.compareTo` compares signed numbers and disagrees for about half of all pairs, so every path now uses one shared comparator ([`UuidOrder`](../backend/src/main/java/com/smartbank/common/UuidOrder.java)) that matches PostgreSQL. Without that, a batch and a single transfer could lock the same two accounts in opposite orders.
+
+**A deadlock the tests found.** A batch locks accounts and then inserts request keys; the unbatched path inserts its key and then locks accounts. If the same key is in flight on both at once, each can wait for the other, and PostgreSQL aborts one. A test that forces exactly this showed the whole batch failing, unrelated transfers included. Now a batch that loses a deadlock (or hits a duplicate key) settles each transfer on the unbatched path, where the contested one is replayed and the others post, and a single transfer chosen as the victim retries. Either way both callers get the same transaction and the key posts once.
+
+**Results.** Interleaved runs (off, on, off, on), 3,000 transfers per row, 32 client threads, pool of 10. The machine was heavily loaded (load average 12–14), so absolute numbers are rough, but the gap held in both pairs:
+
+| Transfers into hot account | Off: transfers/s | On: transfers/s | Off: p99 ms | On: p99 ms |
+| --- | --- | --- | --- | --- |
+| 0% | 252 / 503 | 1,488 / 1,078 | 1,560 / 221 | 47 / 65 |
+| 25% | 210 / 179 | 1,723 / 827 | 4,158 / 1,175 | 43 / 158 |
+| 50% | 408 / 372 | 1,522 / 1,701 | 461 / 387 | 134 / 45 |
+| 75% | 689 / 448 | 1,874 / 1,767 | 181 / 263 | 47 / 42 |
+| 100% | 305 / 419 | 2,444 / 1,857 | 1,584 / 357 | 52 / 79 |
+
+- With every transfer paying one account, throughput is about **5–6× higher** and p99 latency falls from hundreds of milliseconds (or seconds) to under 80 ms.
+- Throughput no longer drops as traffic concentrates on one account. The hot case is now the fastest, because one row lock and one commit cover a whole batch of transfers into it.
+
+**Verified** by the full suite running through the batcher (97 tests): the model-based test, network-cut and `kill -9` crash tests, the 5,000-transfer and mixed hold/transfer concurrency tests, and batch tests for isolation of a rejected transfer, arrival-order decisions, duplicate keys inside a batch, replays, and the deadlock case above.
+
+**Scope.** Only transfers (including by account number) are batched. Deposits, withdrawals, linked transfers and holds still post one at a time.
+
 ## Possible next steps
 
 - Lock a hold's two accounts with one `SELECT … ORDER BY id FOR NO KEY UPDATE` (needs the Java lock order changed to PostgreSQL's unsigned UUID order everywhere).
 - The same short-critical-section design for the hold path.
-- For accounts hotter than one row can serve, split the balance into several sub-balance rows, or apply credits asynchronously (safe for incoming money because the cached balance can only lag low).
+- Batch deposits, withdrawals and linked transfers too.
+- For accounts hotter than one batch per commit can serve, split the balance into several sub-balance rows, or apply credits asynchronously (safe for incoming money because the cached balance can only lag low).
