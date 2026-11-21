@@ -13,6 +13,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
 - **Idempotency keys, scoped per user.** Every deposit, withdrawal, transfer and hold takes an `Idempotency-Key` header (or the `requestKey` body field). The first response, success or business error, is stored and replayed byte-for-byte for retries, marked `Idempotent-Replayed: true`, even when many retries arrive at once. Reusing a key for a different request returns 422. Keys are scoped to the calling user and expire after 24 hours. Posting stays exactly-once even if the server stops between posting and storing the response.
 - **Short, deadlock-free locking.** A transfer writes its transaction and ledger entries first, then updates both balances last with atomic statements in UUID order (the debit only succeeds if available funds cover it). Account locks are held only for those final statements and the commit, and opposing transfers (A→B and B→A) cannot deadlock.
+- **Few database round trips.** A transfer writes its transaction, ledger entries, outbox event and webhook deliveries in one SQL statement and both balance updates in one batch: 6 round trips instead of 17, measured with injected network delay ([docs/benchmarks.md](docs/benchmarks.md#round-trips-per-operation)).
 - **Benchmarked hot-account throughput.** When every transfer pays one account, this design sustains about 2.6× the throughput of locking both accounts for the whole transfer, with about 10× lower p99 latency (≈540 vs ≈200 transfers/s, p99 under 300 ms vs ≈3 s). See [docs/benchmarks.md](docs/benchmarks.md).
 - **Authentication and authorization.** Spring Security with stateless JWT (HS256, 30-minute expiry) and BCrypt password hashing. Users can only read, debit or view the history of accounts they own.
 - **Database-enforced invariants.** Flyway migrations define `CHECK (balance >= 0)`, positive amounts, valid transaction shapes, a `UNIQUE` request key, balanced ledger postings and append-only history, so the database rejects bad states even if application code is wrong.
@@ -128,7 +129,7 @@ Or entirely in Docker (Testcontainers starts its own PostgreSQL through the Dock
 cd backend && docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal -v "$PWD":/app -w /app maven:3.9-eclipse-temurin-21 mvn -B test
 ```
 
-CI runs `mvn verify` on every push and pull request. The hot-account benchmark is opt-in: `mvn test -Dtest=HotAccountBenchmark -Dbenchmark=true` (keep the Mac awake, for example with `caffeinate -i`).
+CI runs `mvn verify` on every push and pull request. The hot-account benchmark and the round-trip profile are opt-in (`-Dtest=RoundTripProfile -Dbenchmark=true` for the latter). The hot-account benchmark: `mvn test -Dtest=HotAccountBenchmark -Dbenchmark=true` (keep the Mac awake, for example with `caffeinate -i`).
 
 ## API
 
@@ -192,7 +193,7 @@ Sending the same command again with the same `$KEY` returns the identical respon
 Not implemented: refresh tokens or token revocation, rate limiting, MFA, account opening, audit logging, pagination beyond the newest 100 transactions, and cross-currency transfers. The demo password and JWT secret in `infra/compose.yml` are for local use only.
 
 Next steps:
-- Fewer round trips per transfer to raise the overall throughput ceiling, and the short-lock design for holds.
+- Re-run the throughput benchmark on a quiet machine after the round-trip and outbox changes, and apply the short-lock design to holds.
 - Webhook hardening: SSRF protection, encrypted secrets with rotation, a replay API for dead-lettered deliveries.
 - Holds in the frontend (the API and tests are complete; the UI does not show holds yet).
 

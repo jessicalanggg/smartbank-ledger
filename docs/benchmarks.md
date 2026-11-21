@@ -79,8 +79,51 @@ Same settings as the baseline: 3,000 transfers per run, 32 client threads, pool 
 
 The outbox adds two SQL statements to every posting (the event and its delivery rows), both before the account-lock window. An interleaved A/B run (before, after, before, after) was taken while the machine was under heavy unrelated load (load average ≈ 15 on 10 cores); the noise exceeded any difference, with the pre-outbox code slower in both pairs. The effect is not yet quantified and should be re-measured on a quiet machine.
 
+## Round trips per operation
+
+The service time of a transfer was mostly network round trips to PostgreSQL. [`RoundTripProfile`](../backend/src/test/java/com/smartbank/benchmark/RoundTripProfile.java) counts them exactly: all traffic goes through Toxiproxy, each operation is timed with and without a 20 ms delay on every database response, and
+
+> round trips = (median time with delay − median time without) / 20 ms
+
+CPU time and machine load cancel out of the difference, so the counts are reliable even on a busy machine. It also prints the statements one transfer sends, from PostgreSQL's statement log.
+
+```bash
+cd backend && mvn test -Dtest=RoundTripProfile -Dbenchmark=true
+```
+
+| Operation | Before | After |
+| --- | --- | --- |
+| Transfer (service) | 17.4 | 6.3 |
+| Deposit (service) | 14.9 | 6.2 |
+| Withdrawal (service) | 14.5 | 6.0 |
+| Create hold (service) | 13.6 | 9.9 |
+| Post hold (service) | 20.8 | 9.9 |
+| Transfer over HTTP, with idempotency key | 24.5 | 11.2 |
+| Retry of a committed transfer | 1.2 | 1.2 |
+
+**What the statement log showed** for one transfer, before:
+
+1. Idempotency lookup; 2–3. each account read separately; 4–5. a `SELECT` before inserting the transaction; 6. insert; 7–8. a `SELECT` before each ledger entry; 9–10. two entry inserts; 11–12. outbox event and deliveries; 13–14. debit and credit; 15. commit.
+
+Three of those `SELECT`s were hidden Hibernate work: the entities have ids assigned in Java, so Spring Data's `save()` cannot tell they are new and calls `merge()`, which reads before inserting.
+
+**Changes:**
+
+- Both accounts are read in one query.
+- The transaction, its two ledger entries, its outbox event and its webhook deliveries are written in **one SQL statement** (data-modifying CTEs; foreign keys are checked at the end of the statement and the ledger balance at commit) by [`PostingWriter`](../backend/src/main/java/com/smartbank/transaction/PostingWriter.java).
+- The debit and credit go in **one JDBC batch**. The server still runs them in the given order, so the UUID lock order is unchanged. Both use one statement shape: a negative delta applies only if the available balance covers it.
+- `Hold` implements `Persistable`, so saving a new hold is one `INSERT` instead of `SELECT` + `INSERT`; Hibernate batching groups the account updates in a hold's flush.
+- Outbox events for holds are written in one statement instead of two.
+- The idempotency claim is one statement in the common case (insert the key, or read the live one), with the earlier multi-step path kept for expired keys and a rare race.
+
+A transfer is now: idempotency lookup, account read, the write, the balance batch, and the commit. The remaining measured ≈1 round trip above those five was not identified.
+
+All 84 tests pass with the new write path, including the model-based test and the network-cut and `kill -9` crash tests.
+
+**Throughput not re-measured.** The machine was under heavy unrelated load (load average ≈ 11 on 10 cores) when this was done, which makes throughput numbers unreliable. With the service time now dominated by about 6 instead of 17 round trips, the benchmark above should be re-run on a quiet machine.
+
 ## Possible next steps
 
-- Fewer round trips per transfer (JDBC batching, one statement for the idempotency check and insert) to raise the overall ceiling.
+- Lock a hold's two accounts with one `SELECT … ORDER BY id FOR NO KEY UPDATE` (needs the Java lock order changed to PostgreSQL's unsigned UUID order everywhere).
 - The same short-critical-section design for the hold path.
 - For accounts hotter than one row can serve, split the balance into several sub-balance rows, or apply credits asynchronously (safe for incoming money because the cached balance can only lag low).
