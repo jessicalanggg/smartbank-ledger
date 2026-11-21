@@ -20,7 +20,8 @@ class BankingServiceTest {
     private final BankingTransactionRepository transactions = mock(BankingTransactionRepository.class);
     private final LedgerEntryRepository ledger = mock(LedgerEntryRepository.class);
     private final org.springframework.transaction.support.TransactionTemplate transactionTemplate = inlineTransactions();
-    private final BankingService service = new BankingService(accounts, transactions, ledger, transactionTemplate);
+    private final com.smartbank.events.OutboxWriter outbox = mock(com.smartbank.events.OutboxWriter.class);
+    private final BankingService service = new BankingService(accounts, transactions, ledger, transactionTemplate, outbox);
 
     /** Runs the callback directly, as if inside a transaction. */
     @SuppressWarnings("unchecked")
@@ -65,6 +66,7 @@ class BankingServiceTest {
         var order = inOrder(transactions, ledger, accounts);
         order.verify(transactions).saveAndFlush(any());
         order.verify(ledger).saveAllAndFlush(anyList());
+        verify(outbox).append(eq("transaction.posted"), any(), any(), eq(from), eq(to));
         order.verify(accounts).debitIfAvailable(from, new BigDecimal("200.00"));
         order.verify(accounts).credit(to, new BigDecimal("200.00"));
         verify(accounts, never()).findLockedById(any());

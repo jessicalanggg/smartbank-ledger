@@ -28,11 +28,12 @@ public final class LedgerTestData {
             SELECT gen_random_uuid(), tx, 'OPENING_EQUITY', NULL, -balance, currency, now() - INTERVAL '1 day' FROM o""";
 
     /**
-     * Empties holds, the ledger and the transaction log, and clears pending amounts.
+     * Empties outbox events and deliveries, holds, the ledger and the transaction
+     * log, and clears pending amounts.
      * TRUNCATE bypasses the append-only and hold-transition triggers.
      */
     public static void truncateLedger(JdbcTemplate jdbc) {
-        jdbc.execute("TRUNCATE holds, ledger_entries, banking_transactions");
+        jdbc.execute("TRUNCATE webhook_deliveries, outbox_events, holds, ledger_entries, banking_transactions");
         jdbc.update("UPDATE accounts SET pending_debits = 0, pending_credits = 0");
     }
 

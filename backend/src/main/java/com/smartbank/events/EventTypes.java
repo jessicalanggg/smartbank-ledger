@@ -1,0 +1,13 @@
+package com.smartbank.events;
+
+import java.util.Set;
+
+public final class EventTypes {
+    private EventTypes() { }
+    public static final String TRANSACTION_POSTED = "transaction.posted";
+    public static final String HOLD_CREATED = "hold.created";
+    public static final String HOLD_POSTED = "hold.posted";
+    public static final String HOLD_VOIDED = "hold.voided";
+    public static final String HOLD_EXPIRED = "hold.expired";
+    public static final Set<String> ALL = Set.of(TRANSACTION_POSTED, HOLD_CREATED, HOLD_POSTED, HOLD_VOIDED, HOLD_EXPIRED);
+}

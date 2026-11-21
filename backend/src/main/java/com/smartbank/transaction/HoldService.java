@@ -1,6 +1,8 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.Account;
+import com.smartbank.events.EventTypes;
+import com.smartbank.events.OutboxWriter;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -25,12 +27,21 @@ public class HoldService {
 
     private final HoldRepository holds;
     private final BankingService banking;
+    private final OutboxWriter outbox;
     private final Clock clock;
 
-    public HoldService(HoldRepository holds, BankingService banking, Clock clock) {
+    public HoldService(HoldRepository holds, BankingService banking, OutboxWriter outbox, Clock clock) {
         this.holds = holds;
         this.banking = banking;
+        this.outbox = outbox;
         this.clock = clock;
+    }
+
+    /** Records an event for a state change of the hold, in the current transaction. */
+    private HoldResponse publish(String eventType, Hold hold) {
+        HoldResponse response = HoldResponse.from(hold);
+        outbox.append(eventType, hold.getId(), response, hold.getSourceAccountId(), hold.getDestinationAccountId());
+        return response;
     }
 
     @Transactional
@@ -55,8 +66,8 @@ public class HoldService {
         Instant now = now();
         Duration ttl = request.expiresInSeconds() == null
                 ? DEFAULT_TTL : Duration.ofSeconds(request.expiresInSeconds());
-        return HoldResponse.from(holds.saveAndFlush(new Hold(source.getId(), target.getId(), request.amount(),
-                source.getCurrency(), request.requestKey(), now, now.plus(ttl))));
+        return publish(EventTypes.HOLD_CREATED, holds.saveAndFlush(new Hold(source.getId(), target.getId(),
+                request.amount(), source.getCurrency(), request.requestKey(), now, now.plus(ttl))));
     }
 
     /** Posts the hold, in full when amount is null, releasing any remainder. */
@@ -82,6 +93,7 @@ public class HoldService {
             release(hold, accounts);
             hold.markExpired(now);
             holds.flush();
+            publish(EventTypes.HOLD_EXPIRED, hold);
             throw new HoldExpiredException();
         }
         release(hold, accounts);
@@ -91,7 +103,7 @@ public class HoldService {
                 hold.getDestinationAccountId(), amount, hold.getCurrency(), null);
         hold.markPosted(amount, tx.id(), now);
         holds.flush();
-        return HoldResponse.from(hold);
+        return publish(EventTypes.HOLD_POSTED, hold);
     }
 
     @Transactional
@@ -106,7 +118,7 @@ public class HoldService {
         release(hold, accounts);
         hold.markVoided(now());
         holds.flush();
-        return HoldResponse.from(hold);
+        return publish(EventTypes.HOLD_VOIDED, hold);
     }
 
     /** Expires one hold if it is still pending and due. Each call is its own transaction. */
@@ -118,6 +130,7 @@ public class HoldService {
         release(hold, accounts);
         hold.markExpired(now);
         holds.flush();
+        publish(EventTypes.HOLD_EXPIRED, hold);
         return true;
     }
 

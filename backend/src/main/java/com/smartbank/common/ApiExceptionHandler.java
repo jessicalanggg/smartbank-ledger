@@ -6,6 +6,7 @@ import org.springframework.security.authentication.BadCredentialsException;
 import com.smartbank.transaction.BankingException;
 import com.smartbank.transaction.HoldNotFoundException;
 import com.smartbank.idempotency.IdempotencyKeyMismatchException;
+import com.smartbank.events.WebhookEndpointNotFoundException;
 import com.smartbank.idempotency.InvalidIdempotencyKeyException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
@@ -27,6 +28,14 @@ public class ApiExceptionHandler {
     @ExceptionHandler(AccountNotFoundException.class)
     public ProblemDetail notFound(AccountNotFoundException ex) {
         return problem(HttpStatus.NOT_FOUND, "Account not found", ex.getMessage());
+    }
+    @ExceptionHandler(WebhookEndpointNotFoundException.class)
+    public ProblemDetail webhookNotFound(WebhookEndpointNotFoundException ex) {
+        return problem(HttpStatus.NOT_FOUND, "Webhook endpoint not found", ex.getMessage());
+    }
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ProblemDetail illegalArgument(IllegalArgumentException ex) {
+        return problem(HttpStatus.BAD_REQUEST, "Invalid request", ex.getMessage());
     }
     @ExceptionHandler(IdempotencyKeyMismatchException.class)
     public ProblemDetail idempotencyMismatch(IdempotencyKeyMismatchException ex) {

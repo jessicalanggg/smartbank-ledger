@@ -9,7 +9,8 @@ import java.math.BigDecimal;
 /**
  * Checks the books: the ledger as a whole balances, every transaction balances,
  * every cached account balance equals the sum of that account's entries, pending
- * amounts equal the open holds, and every posted hold matches its transfer.
+ * amounts equal the open holds, every posted hold matches its transfer, and the
+ * outbox holds exactly one event per posted transaction and per hold state.
  * Runs in one REPEATABLE READ snapshot so concurrent postings cannot make a
  * consistent ledger look inconsistent.
  */
@@ -23,11 +24,13 @@ public class LedgerReconciliation {
 
     public record Report(BigDecimal ledgerTotal, int unbalancedTransactions,
                          int transactionsWithoutEntries, int accountsOutOfBalance,
-                         int accountsWithWrongPendingAmounts, int postedHoldsNotMatchingTransfer) {
+                         int accountsWithWrongPendingAmounts, int postedHoldsNotMatchingTransfer,
+                         int transactionsWithoutExactlyOneEvent, int holdsWithWrongEvents) {
         public boolean isClean() {
             return ledgerTotal.signum() == 0 && unbalancedTransactions == 0
                     && transactionsWithoutEntries == 0 && accountsOutOfBalance == 0
-                    && accountsWithWrongPendingAmounts == 0 && postedHoldsNotMatchingTransfer == 0;
+                    && accountsWithWrongPendingAmounts == 0 && postedHoldsNotMatchingTransfer == 0
+                    && transactionsWithoutExactlyOneEvent == 0 && holdsWithWrongEvents == 0;
         }
     }
 
@@ -66,6 +69,21 @@ public class LedgerReconciliation {
                   AND (t.id IS NULL OR t.transaction_type <> 'TRANSFER' OR t.amount <> h.posted_amount
                        OR t.source_account_id <> h.source_account_id
                        OR t.destination_account_id <> h.destination_account_id)""", Integer.class);
-        return new Report(total, unbalanced, withoutEntries, outOfBalance, wrongPending, badPostings);
+        // The outbox: every posted transaction has exactly one transaction.posted event.
+        Integer missingEvents = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM banking_transactions t
+                WHERE t.transaction_type <> 'OPENING_BALANCE'
+                  AND (SELECT COUNT(*) FROM outbox_events o
+                       WHERE o.event_type = 'transaction.posted' AND o.aggregate_id = t.id) <> 1""", Integer.class);
+        // Every hold has one hold.created event, and one event for its final state if it has one.
+        Integer holdEvents = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM holds h
+                WHERE (SELECT COUNT(*) FROM outbox_events o WHERE o.aggregate_id = h.id AND o.event_type = 'hold.created') <> 1
+                   OR (SELECT COUNT(*) FROM outbox_events o WHERE o.aggregate_id = h.id AND o.event_type <> 'hold.created')
+                      <> CASE WHEN h.status = 'PENDING' THEN 0 ELSE 1 END
+                   OR (h.status <> 'PENDING' AND NOT EXISTS (SELECT 1 FROM outbox_events o
+                       WHERE o.aggregate_id = h.id AND o.event_type = 'hold.' || lower(h.status)))""", Integer.class);
+        return new Report(total, unbalanced, withoutEntries, outOfBalance, wrongPending, badPostings,
+                missingEvents, holdEvents);
     }
 }

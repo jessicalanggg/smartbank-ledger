@@ -1,6 +1,8 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.*;
+import com.smartbank.events.EventTypes;
+import com.smartbank.events.OutboxWriter;
 import com.smartbank.ledger.LedgerAccount;
 import com.smartbank.ledger.LedgerEntry;
 import com.smartbank.ledger.LedgerEntryRepository;
@@ -21,13 +23,15 @@ public class BankingService {
     private final BankingTransactionRepository transactions;
     private final LedgerEntryRepository ledger;
     private final TransactionTemplate transactionTemplate;
+    private final OutboxWriter outbox;
 
     public BankingService(AccountRepository accounts, BankingTransactionRepository transactions,
-            LedgerEntryRepository ledger, TransactionTemplate transactionTemplate) {
+            LedgerEntryRepository ledger, TransactionTemplate transactionTemplate, OutboxWriter outbox) {
         this.accounts = accounts;
         this.transactions = transactions;
         this.ledger = ledger;
         this.transactionTemplate = transactionTemplate;
+        this.outbox = outbox;
     }
 
     /*
@@ -186,15 +190,17 @@ public class BankingService {
     }
 
     /**
-     * Writes the transaction and its balanced ledger entries. Runs inside the
-     * caller's transaction, so balances, transaction and entries commit together.
+     * Writes the transaction, its balanced ledger entries and its outbox event. Runs
+     * inside the caller's transaction, so all of them commit with the balances.
      */
     TransactionResponse record(TransactionType type, UUID from, UUID to,
             BigDecimal amount, String currency, String key) {
         BankingTransaction tx = transactions.saveAndFlush(
                 new BankingTransaction(type, from, to, amount, currency, key));
         ledger.saveAllAndFlush(postings(tx));
-        return TransactionResponse.from(tx);
+        TransactionResponse response = TransactionResponse.from(tx);
+        outbox.append(EventTypes.TRANSACTION_POSTED, tx.getId(), response, from, to);
+        return response;
     }
 
     /** The double-entry postings for a transaction; their amounts sum to zero. */
