@@ -11,7 +11,7 @@ import java.util.UUID;
  */
 @Entity
 @Table(name = "holds")
-public class Hold {
+public class Hold implements org.springframework.data.domain.Persistable<UUID> {
     @Id private UUID id;
     @Column(name = "source_account_id", nullable = false, updatable = false) private UUID sourceAccountId;
     @Column(name = "destination_account_id", nullable = false, updatable = false) private UUID destinationAccountId;
@@ -25,6 +25,18 @@ public class Hold {
     @Column(name = "created_at", nullable = false, updatable = false) private Instant createdAt;
     @Column(name = "expires_at", nullable = false, updatable = false) private Instant expiresAt;
     @Column(name = "resolved_at") private Instant resolvedAt;
+
+    /**
+     * The id is assigned in Java, so Spring Data cannot tell a new hold from an
+     * existing one and would merge (SELECT, then INSERT). Tracking newness here
+     * makes saving a new hold a single INSERT.
+     */
+    @Transient private boolean isNew = true;
+
+    @Override public boolean isNew() { return isNew; }
+
+    @PostLoad @PostPersist
+    void markNotNew() { isNew = false; }
 
     protected Hold() { }
 

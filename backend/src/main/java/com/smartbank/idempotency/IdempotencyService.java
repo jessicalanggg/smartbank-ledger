@@ -24,6 +24,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.UUID;
 import java.util.function.Function;
 
@@ -87,7 +88,7 @@ public class IdempotencyService {
                                           HttpStatus successStatus, Function<String, Object> operation) {
         String key = resolveKey(headerKey, bodyKey);
         UUID user = access.currentUserId();
-        Claim claim = transactions.execute(status -> claim(user, key, fingerprint));
+        Claim claim = claim(user, key, fingerprint);
         if (claim.completed())
             return respond(claim.responseStatus(), claim.responseBody(), true);
 
@@ -108,7 +109,44 @@ public class IdempotencyService {
 
     record Claim(UUID operationKey, boolean completed, int responseStatus, String responseBody) { }
 
+    /**
+     * One round trip in the common case: insert the key, or read the live one. Falls
+     * back to {@link #claimSlowly} when the stored key has expired, or when a
+     * simultaneous first use committed after this statement's snapshot.
+     */
     private Claim claim(UUID user, String key, String fingerprint) {
+        Instant now = clock.instant();
+        List<StoredKey> rows = jdbc.query("""
+                WITH inserted AS (
+                    INSERT INTO idempotency_keys (user_id, idempotency_key, request_hash, operation_key, state, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, 'STARTED', ?, ?)
+                    ON CONFLICT (user_id, idempotency_key) DO NOTHING
+                    RETURNING request_hash, operation_key, state, response_status, response_body, expires_at)
+                SELECT * FROM inserted
+                UNION ALL
+                SELECT request_hash, operation_key, state, response_status, response_body, expires_at
+                FROM idempotency_keys
+                WHERE user_id = ? AND idempotency_key = ? AND NOT EXISTS (SELECT 1 FROM inserted)""",
+                (rs, n) -> new StoredKey(rs.getString("request_hash"), rs.getObject("operation_key", UUID.class),
+                        rs.getString("state"), rs.getInt("response_status"), rs.getString("response_body"),
+                        rs.getTimestamp("expires_at").toInstant()),
+                user, key, fingerprint, UUID.randomUUID(), Timestamp.from(now), Timestamp.from(now.plus(retention)),
+                user, key);
+        if (rows.isEmpty() || !rows.get(0).expiresAt().isAfter(now))
+            return transactions.execute(status -> claimSlowly(user, key, fingerprint));
+        return rows.get(0).toClaim(fingerprint);
+    }
+
+    record StoredKey(String requestHash, UUID operationKey, String state, int responseStatus, String responseBody,
+                     Instant expiresAt) {
+        Claim toClaim(String fingerprint) {
+            if (!fingerprint.equals(requestHash)) throw new IdempotencyKeyMismatchException();
+            return new Claim(operationKey, "COMPLETED".equals(state), responseStatus, responseBody);
+        }
+    }
+
+    /** Removes an expired key and claims it again, in one transaction. */
+    private Claim claimSlowly(UUID user, String key, String fingerprint) {
         Instant now = clock.instant();
         jdbc.update("DELETE FROM idempotency_keys WHERE user_id = ? AND idempotency_key = ? AND expires_at <= ?",
                 user, key, Timestamp.from(now));

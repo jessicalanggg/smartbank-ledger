@@ -1,18 +1,17 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.*;
-import com.smartbank.events.EventTypes;
-import com.smartbank.events.OutboxWriter;
 import com.smartbank.ledger.LedgerAccount;
 import com.smartbank.ledger.LedgerEntry;
-import com.smartbank.ledger.LedgerEntryRepository;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -21,17 +20,15 @@ import java.util.function.Supplier;
 public class BankingService {
     private final AccountRepository accounts;
     private final BankingTransactionRepository transactions;
-    private final LedgerEntryRepository ledger;
     private final TransactionTemplate transactionTemplate;
-    private final OutboxWriter outbox;
+    private final PostingWriter writer;
 
     public BankingService(AccountRepository accounts, BankingTransactionRepository transactions,
-            LedgerEntryRepository ledger, TransactionTemplate transactionTemplate, OutboxWriter outbox) {
+            TransactionTemplate transactionTemplate, PostingWriter writer) {
         this.accounts = accounts;
         this.transactions = transactions;
-        this.ledger = ledger;
         this.transactionTemplate = transactionTemplate;
-        this.outbox = outbox;
+        this.writer = writer;
     }
 
     /*
@@ -39,12 +36,15 @@ public class BankingService {
      *
      * 1. Read the accounts without locking them (existence, currency, a fast
      *    insufficient-funds check on a possibly stale balance).
-     * 2. Insert the transaction and its ledger entries. Nothing is locked yet except
-     *    the new rows and KEY SHARE locks on the referenced accounts, which do not
-     *    block balance updates by other transactions.
-     * 3. Last, update the balances with single atomic statements, in UUID order. The
-     *    debit only succeeds if the available balance covers it; otherwise everything
-     *    rolls back. Account row locks are taken here and held only until commit.
+     * 2. Insert the transaction, its ledger entries and its outbox event, in one
+     *    statement. Nothing is locked yet except the new rows and KEY SHARE locks on
+     *    the referenced accounts, which do not block balance updates by others.
+     * 3. Last, update the balances in one batch, in UUID order. The debit only
+     *    applies if the available balance covers it; otherwise everything rolls
+     *    back. Account row locks are taken here and held only until commit.
+     *
+     * A transfer is five database round trips: the idempotency lookup, the account
+     * read, the write, the balance batch, and the commit (docs/benchmarks.md).
      *
      * Before this design, both accounts were locked first and held for the whole
      * transfer, which capped transfers into one busy account at one per transfer
@@ -104,44 +104,43 @@ public class BankingService {
         BigDecimal amount = request.amount();
         if (type == TransactionType.DEPOSIT) {
             TransactionResponse tx = record(type, null, accountId, amount, account.getCurrency(), request.requestKey());
-            accounts.credit(accountId, amount);
+            writer.applyBalanceChanges(List.of(new PostingWriter.BalanceChange(accountId, amount)));
             return tx;
         }
         failFastIfUnavailable(account, amount);
         TransactionResponse tx = record(type, accountId, null, amount, account.getCurrency(), request.requestKey());
-        debit(accountId, amount);
+        if (!writer.applyBalanceChanges(List.of(new PostingWriter.BalanceChange(accountId, amount.negate())))[0])
+            throw new BankingException("Insufficient funds");
         return tx;
     }
 
     private TransactionResponse postTransfer(TransferRequest request) {
         UUID from = request.fromAccountId(), to = request.toAccountId();
         BigDecimal amount = request.amount();
-        Account source = accounts.findById(from).orElseThrow(() -> new AccountNotFoundException(from));
-        Account target = accounts.findById(to).orElseThrow(() -> new AccountNotFoundException(to));
+        // Both accounts in one query.
+        Map<UUID, Account> found = new HashMap<>();
+        accounts.findAllById(List.of(from, to)).forEach(a -> found.put(a.getId(), a));
+        Account source = found.get(from), target = found.get(to);
+        if (source == null) throw new AccountNotFoundException(from);
+        if (target == null) throw new AccountNotFoundException(to);
         if (!source.getCurrency().equals(target.getCurrency()))
             throw new BankingException("Cross-currency transfers are not supported");
         failFastIfUnavailable(source, amount);
         TransactionResponse tx = record(TransactionType.TRANSFER, from, to, amount, source.getCurrency(),
                 request.requestKey());
-        // Critical section: row locks from here until commit, taken in UUID order.
-        if (from.compareTo(to) < 0) {
-            debit(from, amount);
-            accounts.credit(to, amount);
-        } else {
-            accounts.credit(to, amount);
-            debit(from, amount);
-        }
+        // Critical section: row locks from here until commit, taken in UUID order, in one round trip.
+        var debit = new PostingWriter.BalanceChange(from, amount.negate());
+        var credit = new PostingWriter.BalanceChange(to, amount);
+        boolean debitFirst = from.compareTo(to) < 0;
+        boolean[] applied = writer.applyBalanceChanges(debitFirst ? List.of(debit, credit) : List.of(credit, debit));
+        if (!applied[debitFirst ? 0 : 1])
+            throw new BankingException("Insufficient funds");
         return tx;
     }
 
     /** Rejects early on an unlocked read. Not authoritative: the conditional debit is. */
     private static void failFastIfUnavailable(Account account, BigDecimal amount) {
         if (account.getAvailableBalance().compareTo(amount) < 0)
-            throw new BankingException("Insufficient funds");
-    }
-
-    private void debit(UUID accountId, BigDecimal amount) {
-        if (accounts.debitIfAvailable(accountId, amount) == 0)
             throw new BankingException("Insufficient funds");
     }
 
@@ -195,12 +194,7 @@ public class BankingService {
      */
     TransactionResponse record(TransactionType type, UUID from, UUID to,
             BigDecimal amount, String currency, String key) {
-        BankingTransaction tx = transactions.saveAndFlush(
-                new BankingTransaction(type, from, to, amount, currency, key));
-        ledger.saveAllAndFlush(postings(tx));
-        TransactionResponse response = TransactionResponse.from(tx);
-        outbox.append(EventTypes.TRANSACTION_POSTED, tx.getId(), response, from, to);
-        return response;
+        return writer.post(new BankingTransaction(type, from, to, amount, currency, key));
     }
 
     /** The double-entry postings for a transaction; their amounts sum to zero. */

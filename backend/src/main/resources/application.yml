@@ -9,6 +9,11 @@ spring:
     open-in-view: false
     hibernate:
       ddl-auto: validate
+    properties:
+      # Send same-shaped statements from one flush (e.g. two account updates) in one round trip.
+      hibernate.jdbc.batch_size: 25
+      hibernate.order_updates: true
+      hibernate.order_inserts: true
   flyway:
     enabled: true
 management:
