@@ -12,17 +12,33 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 class BankingServiceTest {
     private final AccountRepository accounts = mock(AccountRepository.class);
     private final BankingTransactionRepository transactions = mock(BankingTransactionRepository.class);
     private final LedgerEntryRepository ledger = mock(LedgerEntryRepository.class);
-    private final BankingService service = new BankingService(accounts, transactions, ledger);
+    private final org.springframework.transaction.support.TransactionTemplate transactionTemplate = inlineTransactions();
+    private final BankingService service = new BankingService(accounts, transactions, ledger, transactionTemplate);
+
+    /** Runs the callback directly, as if inside a transaction. */
+    @SuppressWarnings("unchecked")
+    private static org.springframework.transaction.support.TransactionTemplate inlineTransactions() {
+        var template = mock(org.springframework.transaction.support.TransactionTemplate.class);
+        when(template.execute(any())).thenAnswer(i ->
+            ((org.springframework.transaction.support.TransactionCallback<Object>) i.getArgument(0)).doInTransaction(null));
+        return template;
+    }
 
     private Account account(UUID id, String balance, String currency) {
         Account a = new AccountFixture().make(id, balance, currency);
+        when(accounts.findById(id)).thenReturn(Optional.of(a));
         when(accounts.findLockedById(id)).thenReturn(Optional.of(a));
+        // The conditional debit succeeds only when the fixture's balance covers it.
+        when(accounts.debitIfAvailable(eq(id), any())).thenAnswer(i ->
+            a.getAvailableBalance().compareTo(i.getArgument(1)) >= 0 ? 1 : 0);
+        when(accounts.credit(eq(id), any())).thenReturn(1);
         return a;
     }
     private static class AccountFixture {
@@ -41,23 +57,38 @@ class BankingServiceTest {
     @Test void transferUpdatesBothBalances() {
         UUID from = UUID.fromString("11111111-1111-4111-8111-111111111111");
         UUID to = UUID.fromString("22222222-2222-4222-8222-222222222222");
-        Account a = account(from, "1250.00", "CAD");
-        Account b = account(to, "3800.50", "CAD");
+        account(from, "1250.00", "CAD");
+        account(to, "3800.50", "CAD");
         when(transactions.saveAndFlush(any())).thenAnswer(i -> i.getArgument(0));
         service.transfer(new TransferRequest(from, to, new BigDecimal("200.00"), "transfer-test-1"));
-        assertEquals(0, a.getBalance().compareTo(new BigDecimal("1050.00")));
-        assertEquals(0, b.getBalance().compareTo(new BigDecimal("4000.50")));
-        verify(transactions).saveAndFlush(any());
-        verify(ledger).saveAllAndFlush(anyList());
+        // Ledger rows first, then the balance updates, debit before credit (UUID order here).
+        var order = inOrder(transactions, ledger, accounts);
+        order.verify(transactions).saveAndFlush(any());
+        order.verify(ledger).saveAllAndFlush(anyList());
+        order.verify(accounts).debitIfAvailable(from, new BigDecimal("200.00"));
+        order.verify(accounts).credit(to, new BigDecimal("200.00"));
+        verify(accounts, never()).findLockedById(any());
     }
     @Test void insufficientFundsDoesNotCreditTarget() {
         UUID from = UUID.randomUUID(), to = UUID.randomUUID();
         account(from, "10.00", "CAD");
-        Account b = account(to, "100.00", "CAD");
+        account(to, "100.00", "CAD");
         assertThrows(BankingException.class, () -> service.transfer(
             new TransferRequest(from, to, new BigDecimal("200.00"), "too-much")));
-        assertEquals(0, b.getBalance().compareTo(new BigDecimal("100.00")));
+        verify(accounts, never()).credit(any(), any());
         verify(transactions, never()).saveAndFlush(any());
+    }
+    @Test void staleReadIsOverruledByTheConditionalDebit() {
+        // The unlocked read says there is enough, but by the time of the debit there is not.
+        UUID from = UUID.fromString("11111111-1111-4111-8111-111111111111");
+        UUID to = UUID.fromString("22222222-2222-4222-8222-222222222222");
+        account(from, "500.00", "CAD");
+        account(to, "0.00", "CAD");
+        when(accounts.debitIfAvailable(eq(from), any())).thenReturn(0);
+        when(transactions.saveAndFlush(any())).thenAnswer(i -> i.getArgument(0));
+        assertThrows(BankingException.class, () -> service.transfer(
+            new TransferRequest(from, to, new BigDecimal("200.00"), "stale")));
+        verify(accounts, never()).credit(any(), any());
     }
     @Test void rejectsSameAccountTransfer() {
         UUID id = UUID.randomUUID();
@@ -78,7 +109,19 @@ class BankingServiceTest {
         when(transactions.findByRequestKey("repeat")).thenReturn(Optional.of(previous));
         var result = service.transfer(new TransferRequest(from, to, new BigDecimal("5.00"), "repeat"));
         assertEquals(previous.getId(), result.id());
-        verify(accounts, never()).findLockedById(any());
+        verify(accounts, never()).debitIfAvailable(any(), any());
+        verify(accounts, never()).credit(any(), any());
+    }
+    @Test void simultaneousDuplicateIsReplayedFromTheCommittedRow() {
+        UUID from = UUID.randomUUID(), to = UUID.randomUUID();
+        account(from, "100.00", "CAD"); account(to, "0.00", "CAD");
+        BankingTransaction winner = new BankingTransaction(TransactionType.TRANSFER, from, to,
+            new BigDecimal("5.00"), "CAD", "dup");
+        // First lookup: nothing committed yet. Insert hits the unique index. Second lookup: the winner.
+        when(transactions.findByRequestKey("dup")).thenReturn(Optional.empty(), Optional.of(winner));
+        when(transactions.saveAndFlush(any())).thenThrow(new org.springframework.dao.DuplicateKeyException("request_key"));
+        var result = service.transfer(new TransferRequest(from, to, new BigDecimal("5.00"), "dup"));
+        assertEquals(winner.getId(), result.id());
     }
     @Test void duplicateDepositReturnsOriginalWithoutLocking() {
         UUID id = UUID.randomUUID();
@@ -87,7 +130,7 @@ class BankingServiceTest {
         when(transactions.findByRequestKey("dep")).thenReturn(Optional.of(previous));
         var result = service.deposit(id, new MoneyRequest(new BigDecimal("5.00"), "dep"));
         assertEquals(previous.getId(), result.id());
-        verify(accounts, never()).findLockedById(any());
+        verify(accounts, never()).credit(any(), any());
         verify(transactions, never()).saveAndFlush(any());
     }
     @Test void depositKeyReusedForWithdrawalIsRejected() {

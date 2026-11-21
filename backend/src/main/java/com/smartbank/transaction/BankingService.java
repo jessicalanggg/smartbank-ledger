@@ -4,109 +4,139 @@ import com.smartbank.account.*;
 import com.smartbank.ledger.LedgerAccount;
 import com.smartbank.ledger.LedgerEntry;
 import com.smartbank.ledger.LedgerEntryRepository;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 @Service
 public class BankingService {
     private final AccountRepository accounts;
     private final BankingTransactionRepository transactions;
     private final LedgerEntryRepository ledger;
+    private final TransactionTemplate transactionTemplate;
 
     public BankingService(AccountRepository accounts, BankingTransactionRepository transactions,
-            LedgerEntryRepository ledger) {
+            LedgerEntryRepository ledger, TransactionTemplate transactionTemplate) {
         this.accounts = accounts;
         this.transactions = transactions;
         this.ledger = ledger;
+        this.transactionTemplate = transactionTemplate;
     }
 
-    @Transactional
-    public TransactionResponse deposit(UUID accountId, MoneyRequest request) {
-        return postSingleAccount(TransactionType.DEPOSIT, accountId, request);
-    }
-
-    @Transactional
-    public TransactionResponse withdraw(UUID accountId, MoneyRequest request) {
-        return postSingleAccount(TransactionType.WITHDRAWAL, accountId, request);
-    }
-
-    /**
-     * Deposits and withdrawals follow the same idempotency protocol as transfers:
-     * check the key, lock the account, re-check the key while holding the lock
-     * (a concurrent identical request commits before we get the lock), then post.
-     * Conflicting reuse that is not serialised by the lock is stopped by the
-     * UNIQUE constraint on request_key.
+    /*
+     * How deposits, withdrawals and transfers keep account locks short:
+     *
+     * 1. Read the accounts without locking them (existence, currency, a fast
+     *    insufficient-funds check on a possibly stale balance).
+     * 2. Insert the transaction and its ledger entries. Nothing is locked yet except
+     *    the new rows and KEY SHARE locks on the referenced accounts, which do not
+     *    block balance updates by other transactions.
+     * 3. Last, update the balances with single atomic statements, in UUID order. The
+     *    debit only succeeds if the available balance covers it; otherwise everything
+     *    rolls back. Account row locks are taken here and held only until commit.
+     *
+     * Before this design, both accounts were locked first and held for the whole
+     * transfer, which capped transfers into one busy account at one per transfer
+     * duration (see docs/benchmarks.md).
+     *
+     * Idempotency: a retry whose key is already committed is replayed up front. A
+     * simultaneous duplicate blocks on the UNIQUE request_key index until the first
+     * request commits, then fails; it is then replayed from the committed row.
      */
-    private TransactionResponse postSingleAccount(TransactionType type, UUID accountId, MoneyRequest request) {
-        var previous = transactions.findByRequestKey(request.requestKey());
-        if (previous.isPresent())
-            return replay(previous.get(), type, accountId, request.amount());
-        Account account = locked(accountId);
-        previous = transactions.findByRequestKey(request.requestKey());
-        if (previous.isPresent())
-            return replay(previous.get(), type, accountId, request.amount());
-        if (type == TransactionType.DEPOSIT) {
-            account.credit(request.amount());
-            return record(type, null, accountId, request.amount(), account.getCurrency(), request.requestKey());
-        }
-        account.debit(request.amount());
-        return record(type, accountId, null, request.amount(), account.getCurrency(), request.requestKey());
+
+    public TransactionResponse deposit(UUID accountId, MoneyRequest request) {
+        return idempotent(request.requestKey(),
+                prior -> replay(prior, TransactionType.DEPOSIT, accountId, request.amount()),
+                () -> postSingleAccount(TransactionType.DEPOSIT, accountId, request));
     }
 
-    @Transactional
-    public TransactionResponse transferByAccountNumber(
-            TransferByAccountNumberRequest request) {
+    public TransactionResponse withdraw(UUID accountId, MoneyRequest request) {
+        return idempotent(request.requestKey(),
+                prior -> replay(prior, TransactionType.WITHDRAWAL, accountId, request.amount()),
+                () -> postSingleAccount(TransactionType.WITHDRAWAL, accountId, request));
+    }
 
-        String accountNumber = request.toAccountNumber().trim();
-
-        Account destination = accounts.findByAccountNumber(accountNumber)
+    public TransactionResponse transferByAccountNumber(TransferByAccountNumberRequest request) {
+        Account destination = accounts.findByAccountNumber(request.toAccountNumber().trim())
                 .orElseThrow(() -> new BankingException("Destination account not found"));
-
-        TransferRequest transferRequest = new TransferRequest(
-                request.fromAccountId(),
-                destination.getId(),
-                request.amount(),
-                request.requestKey());
-
-        return transfer(transferRequest);
+        return transfer(new TransferRequest(request.fromAccountId(), destination.getId(),
+                request.amount(), request.requestKey()));
     }
 
-    @Transactional
     public TransactionResponse transfer(TransferRequest request) {
         if (request.fromAccountId().equals(request.toAccountId()))
             throw new BankingException("Source and destination must differ");
-        // Sequential retries return the original transfer; conflicting reuse is
-        // rejected.
-        var previous = transactions.findByRequestKey(request.requestKey());
-        if (previous.isPresent())
-            return replay(previous.get(), request);
+        return idempotent(request.requestKey(), prior -> replay(prior, request), () -> postTransfer(request));
+    }
 
-        // Deterministic lock ordering avoids deadlocks for opposing transfers.
-        UUID firstId = request.fromAccountId().compareTo(request.toAccountId()) < 0
-                ? request.fromAccountId()
-                : request.toAccountId();
-        UUID secondId = firstId.equals(request.fromAccountId()) ? request.toAccountId() : request.fromAccountId();
-        Account first = locked(firstId);
-        Account second = locked(secondId);
-        Account source = first.getId().equals(request.fromAccountId()) ? first : second;
-        Account target = first.getId().equals(request.toAccountId()) ? first : second;
+    private TransactionResponse idempotent(String requestKey,
+            Function<BankingTransaction, TransactionResponse> replay,
+            Supplier<TransactionResponse> post) {
+        var previous = transactions.findByRequestKey(requestKey);
+        if (previous.isPresent())
+            return replay.apply(previous.get());
+        try {
+            return transactionTemplate.execute(status -> post.get());
+        } catch (DataIntegrityViolationException e) {
+            // A simultaneous request with the same key committed first.
+            var winner = transactions.findByRequestKey(requestKey);
+            if (winner.isPresent())
+                return replay.apply(winner.get());
+            throw e;
+        }
+    }
+
+    private TransactionResponse postSingleAccount(TransactionType type, UUID accountId, MoneyRequest request) {
+        Account account = accounts.findById(accountId).orElseThrow(() -> new AccountNotFoundException(accountId));
+        BigDecimal amount = request.amount();
+        if (type == TransactionType.DEPOSIT) {
+            TransactionResponse tx = record(type, null, accountId, amount, account.getCurrency(), request.requestKey());
+            accounts.credit(accountId, amount);
+            return tx;
+        }
+        failFastIfUnavailable(account, amount);
+        TransactionResponse tx = record(type, accountId, null, amount, account.getCurrency(), request.requestKey());
+        debit(accountId, amount);
+        return tx;
+    }
+
+    private TransactionResponse postTransfer(TransferRequest request) {
+        UUID from = request.fromAccountId(), to = request.toAccountId();
+        BigDecimal amount = request.amount();
+        Account source = accounts.findById(from).orElseThrow(() -> new AccountNotFoundException(from));
+        Account target = accounts.findById(to).orElseThrow(() -> new AccountNotFoundException(to));
         if (!source.getCurrency().equals(target.getCurrency()))
             throw new BankingException("Cross-currency transfers are not supported");
-        // Recheck while account locks are held. A simultaneous identical request may
-        // still
-        // race before commit; the database UNIQUE constraint prevents a duplicate
-        // posting.
-        previous = transactions.findByRequestKey(request.requestKey());
-        if (previous.isPresent())
-            return replay(previous.get(), request);
-        source.debit(request.amount());
-        target.credit(request.amount());
-        return record(TransactionType.TRANSFER, source.getId(), target.getId(),
-                request.amount(), source.getCurrency(), request.requestKey());
+        failFastIfUnavailable(source, amount);
+        TransactionResponse tx = record(TransactionType.TRANSFER, from, to, amount, source.getCurrency(),
+                request.requestKey());
+        // Critical section: row locks from here until commit, taken in UUID order.
+        if (from.compareTo(to) < 0) {
+            debit(from, amount);
+            accounts.credit(to, amount);
+        } else {
+            accounts.credit(to, amount);
+            debit(from, amount);
+        }
+        return tx;
+    }
+
+    /** Rejects early on an unlocked read. Not authoritative: the conditional debit is. */
+    private static void failFastIfUnavailable(Account account, BigDecimal amount) {
+        if (account.getAvailableBalance().compareTo(amount) < 0)
+            throw new BankingException("Insufficient funds");
+    }
+
+    private void debit(UUID accountId, BigDecimal amount) {
+        if (accounts.debitIfAvailable(accountId, amount) == 0)
+            throw new BankingException("Insufficient funds");
     }
 
     /** Two accounts locked in UUID order, the order every money-moving path uses. */
