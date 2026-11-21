@@ -18,6 +18,9 @@ public class BankingTransaction {
     @Column(nullable = false, length = 3) private String currency;
     @Column(name = "request_key", unique = true, length = 100) private String requestKey;
     @Column(name = "created_at", nullable = false) private Instant createdAt;
+    /** Set for legs of a linked transfer: the group id and this leg's position. */
+    @Column(name = "link_id", updatable = false) private UUID linkId;
+    @Column(name = "link_index", updatable = false) private Short linkIndex;
 
     protected BankingTransaction() { }
     public BankingTransaction(TransactionType type, UUID source, UUID destination,
@@ -28,6 +31,16 @@ public class BankingTransaction {
         // PostgreSQL stores microseconds; truncating here keeps the API response equal to what is stored.
         this.createdAt = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS);
     }
+
+    /** A leg of a linked transfer. Only leg 0 carries the group's request key. */
+    static BankingTransaction linkedLeg(UUID linkId, int index, UUID source, UUID destination,
+                                        BigDecimal amount, String currency, String groupRequestKey) {
+        BankingTransaction leg = new BankingTransaction(TransactionType.TRANSFER, source, destination, amount,
+                currency, index == 0 ? groupRequestKey : null);
+        leg.linkId = linkId;
+        leg.linkIndex = (short) index;
+        return leg;
+    }
     public UUID getId() { return id; }
     public TransactionType getTransactionType() { return transactionType; }
     public UUID getSourceAccountId() { return sourceAccountId; }
@@ -36,4 +49,6 @@ public class BankingTransaction {
     public String getCurrency() { return currency; }
     public String getRequestKey() { return requestKey; }
     public Instant getCreatedAt() { return createdAt; }
+    public UUID getLinkId() { return linkId; }
+    public Integer getLinkIndex() { return linkIndex == null ? null : linkIndex.intValue(); }
 }

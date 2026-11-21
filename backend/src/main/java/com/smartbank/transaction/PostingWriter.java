@@ -11,6 +11,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
@@ -18,20 +19,14 @@ import java.util.UUID;
  * Writes postings with as few database round trips as possible. Both methods run
  * in the caller's transaction.
  *
- * - {@link #post} writes the transaction row, its ledger entries, its outbox event
- *   and the webhook deliveries in one SQL statement. Foreign keys between them are
+ * - {@link #postAll} writes any number of transactions with their ledger entries,
+ *   outbox events and webhook deliveries in one SQL statement. Foreign keys between them are
  *   checked at the end of the statement, and the ledger balance check at commit.
  * - {@link #applyBalanceChanges} sends all balance updates in one JDBC batch. The
  *   server runs them in the given order, so the caller's lock order is kept.
  */
 @Component
 public class PostingWriter {
-    private static final String INSERT_TRANSACTION = """
-            INSERT INTO banking_transactions
-                (id, transaction_type, source_account_id, destination_account_id, amount, currency, request_key, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""";
-    private static final String ENTRY_VALUES = "(?, ?, ?, ?, ?, ?, ?)";
-
     /**
      * One statement for debits and credits: a negative delta is a debit and only
      * applies if the available balance covers it; a positive delta always applies.
@@ -52,38 +47,69 @@ public class PostingWriter {
 
     @Transactional(propagation = Propagation.MANDATORY)
     public TransactionResponse post(BankingTransaction tx) {
-        TransactionResponse response = TransactionResponse.from(tx);
-        List<LedgerEntry> entries = BankingService.postings(tx);
-        var event = outbox.prepare(EventTypes.TRANSACTION_POSTED, tx.getId(), response,
-                tx.getSourceAccountId(), tx.getDestinationAccountId());
+        return postAll(List.of(tx)).get(0);
+    }
 
-        List<Object> params = new ArrayList<>(List.of(tx.getId(), tx.getTransactionType().name()));
-        params.add(tx.getSourceAccountId());
-        params.add(tx.getDestinationAccountId());
-        params.addAll(List.of(tx.getAmount(), tx.getCurrency()));
-        params.add(tx.getRequestKey());
-        params.add(Timestamp.from(tx.getCreatedAt()));
-        List<String> values = new ArrayList<>();
-        for (LedgerEntry e : entries) {
-            values.add(ENTRY_VALUES);
-            params.add(e.getId());
-            params.add(e.getTransactionId());
-            params.add(e.getLedgerAccount().name());
-            params.add(e.getAccountId());
-            params.add(e.getAmount());
-            params.add(e.getCurrency());
-            params.add(Timestamp.from(e.getCreatedAt()));
+    /**
+     * Writes every transaction, all their ledger entries, one event each and the
+     * webhook deliveries for those events, in a single statement.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public List<TransactionResponse> postAll(List<BankingTransaction> txs) {
+        List<TransactionResponse> responses = new ArrayList<>();
+        List<Object> params = new ArrayList<>();
+        List<String> txValues = new ArrayList<>(), entryValues = new ArrayList<>(),
+                eventValues = new ArrayList<>(), fanOutValues = new ArrayList<>();
+        for (BankingTransaction tx : txs) {
+            txValues.add("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            params.addAll(Arrays.asList(tx.getId(), tx.getTransactionType().name(), tx.getSourceAccountId(),
+                    tx.getDestinationAccountId(), tx.getAmount(), tx.getCurrency(), tx.getRequestKey(),
+                    Timestamp.from(tx.getCreatedAt()), tx.getLinkId(), tx.getLinkIndex()));
         }
-        params.addAll(List.of(event.eventParams()));
-        params.addAll(List.of(event.fanOutParams()));
-
-        jdbc.update("WITH tx AS (" + INSERT_TRANSACTION + "),\n"
-                + "entries AS (INSERT INTO ledger_entries "
-                + "(id, transaction_id, ledger_account, account_id, amount, currency, created_at) VALUES "
-                + String.join(", ", values) + "),\n"
-                + "event AS (" + OutboxWriter.INSERT_EVENT + ")\n"
-                + OutboxWriter.FAN_OUT, params.toArray());
-        return response;
+        for (BankingTransaction tx : txs) {
+            for (LedgerEntry e : BankingService.postings(tx)) {
+                entryValues.add("(?, ?, ?, ?, ?, ?, ?)");
+                params.addAll(Arrays.asList(e.getId(), e.getTransactionId(), e.getLedgerAccount().name(),
+                        e.getAccountId(), e.getAmount(), e.getCurrency(), Timestamp.from(e.getCreatedAt())));
+            }
+        }
+        List<OutboxWriter.PreparedEvent> events = new ArrayList<>();
+        for (BankingTransaction tx : txs) {
+            TransactionResponse response = TransactionResponse.from(tx);
+            responses.add(response);
+            var event = outbox.prepare(EventTypes.TRANSACTION_POSTED, tx.getId(), response,
+                    tx.getSourceAccountId(), tx.getDestinationAccountId());
+            events.add(event);
+            eventValues.add("(?, ?, ?, string_to_array(?, ',')::uuid[], ?, ?)");
+            params.addAll(List.of(event.eventParams()));
+        }
+        for (var event : events) {
+            fanOutValues.add("(?::uuid, ?::varchar, ?::text, ?::timestamptz)");
+            params.addAll(Arrays.asList(event.id(), event.type(), event.accounts(), event.at()));
+        }
+        jdbc.update("""
+                WITH tx AS (
+                    INSERT INTO banking_transactions (id, transaction_type, source_account_id, destination_account_id,
+                        amount, currency, request_key, created_at, link_id, link_index)
+                    VALUES %s),
+                entries AS (
+                    INSERT INTO ledger_entries (id, transaction_id, ledger_account, account_id, amount, currency, created_at)
+                    VALUES %s),
+                events AS (
+                    INSERT INTO outbox_events (id, event_type, aggregate_id, account_ids, payload, created_at)
+                    VALUES %s)
+                INSERT INTO webhook_deliveries (id, event_id, endpoint_id, status, attempts, next_attempt_at, created_at)
+                SELECT gen_random_uuid(), ev.id, e.id, 'PENDING', 0, ev.at, ev.at
+                FROM (VALUES %s) AS ev(id, type, accounts, at)
+                JOIN webhook_endpoints e
+                  ON e.active
+                 AND (e.event_types IS NULL OR ev.type = ANY (e.event_types))
+                 AND EXISTS (SELECT 1 FROM accounts a
+                             WHERE a.id = ANY (string_to_array(ev.accounts, ',')::uuid[]) AND a.owner_user_id = e.user_id)"""
+                .formatted(String.join(", ", txValues), String.join(", ", entryValues),
+                        String.join(", ", eventValues), String.join(", ", fanOutValues)),
+                params.toArray());
+        return responses;
     }
 
     /** Applies the changes in order, in one round trip; returns whether each one applied. */

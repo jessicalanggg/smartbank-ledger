@@ -67,6 +67,19 @@ public class BankingController {
                         request.fromAccountId(), toAccountNumber, request.amount(), op)));
     }
 
+    /** All transfers post or none do. The caller must own every source account. */
+    @PostMapping("/transfers/linked")
+    public ResponseEntity<String> linkedTransfer(@Valid @RequestBody LinkedTransferRequest request,
+                                                 @RequestHeader(value = HEADER, required = false) String key) {
+        request.transfers().stream().map(LinkedTransferRequest.Leg::fromAccountId).distinct()
+                .forEach(access::requireOwner);
+        Object[] parts = request.transfers().stream()
+                .flatMap(l -> java.util.stream.Stream.of(l.fromAccountId(), l.toAccountId(), l.amount()))
+                .toArray();
+        return idempotency.execute(key, request.requestKey(), fingerprint("linked-transfer", parts),
+                HttpStatus.CREATED, op -> service.linkedTransfer(new LinkedTransferRequest(request.transfers(), op)));
+    }
+
     @GetMapping("/accounts/{id}/transactions")
     public List<TransactionResponse> history(@PathVariable UUID id) {
         access.requireOwner(id);

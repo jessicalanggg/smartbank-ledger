@@ -284,6 +284,57 @@ class ConcurrencyIntegrationTest {
                 operations, THREADS, elapsedMs, new TreeMap<>(outcomes));
     }
 
+    @Test
+    void concurrentLinkedTransfersPostAllOrNothing() throws Exception {
+        BigDecimal totalBefore = totalBalance();
+        int groups = 1_500;
+        Map<String, Integer> legsPerKey = new ConcurrentHashMap<>();
+        AtomicInteger committed = new AtomicInteger(), rejected = new AtomicInteger();
+        ConcurrentLinkedQueue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
+
+        List<Callable<Void>> work = new ArrayList<>();
+        for (int g = 0; g < groups; g++) {
+            int n = g;
+            work.add(() -> {
+                ThreadLocalRandom r = ThreadLocalRandom.current();
+                List<LinkedTransferRequest.Leg> legs = new ArrayList<>();
+                for (int i = r.nextInt(2, 6); i > 0; i--) {
+                    int a = r.nextInt(ACCOUNTS), b;
+                    do { b = r.nextInt(ACCOUNTS); } while (b == a);
+                    legs.add(new LinkedTransferRequest.Leg(accountIds.get(a), accountIds.get(b),
+                            BigDecimal.valueOf(r.nextInt(1, 40_001), 2)));
+                }
+                String key = "linked-" + n;
+                try {
+                    banking.linkedTransfer(new LinkedTransferRequest(legs, key));
+                    legsPerKey.put(key, legs.size());
+                    committed.incrementAndGet();
+                } catch (BankingException e) {
+                    rejected.incrementAndGet();
+                } catch (Throwable t) {
+                    unexpected.add(t);
+                }
+                return null;
+            });
+        }
+        long elapsedMs = runConcurrently(work);
+
+        assertTrue(unexpected.isEmpty(), () -> "Unexpected failures (deadlocks etc.): "
+                + unexpected.stream().limit(5).map(Throwable::toString).toList());
+        assertEquals(0, totalBefore.compareTo(totalBalance()), "Total money must be conserved");
+        // All or nothing: every committed group has all its legs, rejected groups have none.
+        Map<String, Integer> stored = new HashMap<>();
+        jdbc.query("""
+                SELECT k.request_key, COUNT(*) AS legs FROM banking_transactions t
+                JOIN banking_transactions k ON k.link_id = t.link_id AND k.link_index = 0
+                WHERE t.link_id IS NOT NULL GROUP BY k.request_key""",
+                rs -> { stored.put(rs.getString("request_key"), rs.getInt("legs")); });
+        assertEquals(legsPerKey, stored);
+        assertLedgerClean();
+        System.out.printf("[concurrency] %d linked transfers (2-5 legs) on %d threads in %d ms: %d committed, %d rejected, all-or-nothing held, books reconciled%n",
+                groups, THREADS, elapsedMs, committed.get(), rejected.get());
+    }
+
     /** Starts every task at the same instant and returns the wall-clock time taken. */
     private long runConcurrently(List<Callable<Void>> work) throws Exception {
         ExecutorService pool = Executors.newFixedThreadPool(THREADS);

@@ -9,7 +9,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -78,6 +82,90 @@ public class BankingService {
         if (request.fromAccountId().equals(request.toAccountId()))
             throw new BankingException("Source and destination must differ");
         return idempotent(request.requestKey(), prior -> replay(prior, request), () -> postTransfer(request));
+    }
+
+    /**
+     * Posts every leg or none. Each leg is checked on its own (accounts exist, differ,
+     * share a currency); funds are checked on each account's net change across the
+     * group, so an account may pass on money it receives in the same group. Balance
+     * updates are one batch in UUID order, like single transfers.
+     */
+    public LinkedTransferResponse linkedTransfer(LinkedTransferRequest request) {
+        List<LinkedTransferRequest.Leg> legs = request.transfers();
+        if (legs == null || legs.isEmpty() || legs.size() > 20)
+            throw new BankingException("A linked transfer needs between 1 and 20 transfers");
+        for (int i = 0; i < legs.size(); i++)
+            if (legs.get(i).fromAccountId().equals(legs.get(i).toAccountId()))
+                throw new BankingException("Transfer " + i + ": source and destination must differ");
+        String key = request.requestKey();
+        if (key == null || key.isBlank())
+            throw new IllegalArgumentException("A request key is required");
+        var previous = transactions.findByRequestKey(key);
+        if (previous.isPresent())
+            return replayLinked(previous.get(), legs);
+        try {
+            return transactionTemplate.execute(status -> postLinked(legs, key));
+        } catch (DataIntegrityViolationException e) {
+            var winner = transactions.findByRequestKey(key);
+            if (winner.isPresent())
+                return replayLinked(winner.get(), legs);
+            throw e;
+        }
+    }
+
+    private LinkedTransferResponse postLinked(List<LinkedTransferRequest.Leg> legs, String key) {
+        Set<UUID> ids = new HashSet<>();
+        legs.forEach(l -> { ids.add(l.fromAccountId()); ids.add(l.toAccountId()); });
+        Map<UUID, Account> found = new HashMap<>();
+        accounts.findAllById(ids).forEach(a -> found.put(a.getId(), a));
+        // Net change per account, kept in UUID order for the balance batch.
+        Map<UUID, BigDecimal> net = new TreeMap<>();
+        UUID linkId = UUID.randomUUID();
+        List<BankingTransaction> rows = new ArrayList<>();
+        for (int i = 0; i < legs.size(); i++) {
+            var leg = legs.get(i);
+            Account source = found.get(leg.fromAccountId()), target = found.get(leg.toAccountId());
+            if (source == null) throw new AccountNotFoundException(leg.fromAccountId());
+            if (target == null) throw new AccountNotFoundException(leg.toAccountId());
+            if (!source.getCurrency().equals(target.getCurrency()))
+                throw new BankingException("Transfer " + i + ": cross-currency transfers are not supported");
+            net.merge(leg.fromAccountId(), leg.amount().negate(), BigDecimal::add);
+            net.merge(leg.toAccountId(), leg.amount(), BigDecimal::add);
+            rows.add(BankingTransaction.linkedLeg(linkId, i, leg.fromAccountId(), leg.toAccountId(),
+                    leg.amount(), source.getCurrency(), key));
+        }
+        for (var change : net.entrySet())
+            if (change.getValue().signum() < 0
+                    && found.get(change.getKey()).getAvailableBalance().compareTo(change.getValue().negate()) < 0)
+                throw new BankingException("Insufficient funds in account " + change.getKey());
+
+        List<TransactionResponse> posted = writer.postAll(rows);
+        List<PostingWriter.BalanceChange> changes = net.entrySet().stream()
+                .filter(e -> e.getValue().signum() != 0)
+                .map(e -> new PostingWriter.BalanceChange(e.getKey(), e.getValue()))
+                .toList();
+        boolean[] applied = writer.applyBalanceChanges(changes);
+        for (int i = 0; i < changes.size(); i++)
+            if (!applied[i])
+                throw new BankingException("Insufficient funds in account " + changes.get(i).accountId());
+        return new LinkedTransferResponse(linkId, posted);
+    }
+
+    private LinkedTransferResponse replayLinked(BankingTransaction prior, List<LinkedTransferRequest.Leg> legs) {
+        if (prior.getLinkId() == null)
+            throw new BankingException("Request key was already used for a different operation");
+        List<BankingTransaction> stored = transactions.findByLinkIdOrderByLinkIndex(prior.getLinkId());
+        boolean same = stored.size() == legs.size();
+        for (int i = 0; same && i < legs.size(); i++) {
+            var leg = legs.get(i);
+            var tx = stored.get(i);
+            same = leg.fromAccountId().equals(tx.getSourceAccountId())
+                    && leg.toAccountId().equals(tx.getDestinationAccountId())
+                    && leg.amount().compareTo(tx.getAmount()) == 0;
+        }
+        if (!same)
+            throw new BankingException("Request key was already used for a different operation");
+        return new LinkedTransferResponse(prior.getLinkId(), stored.stream().map(TransactionResponse::from).toList());
     }
 
     private TransactionResponse idempotent(String requestKey,
@@ -165,6 +253,7 @@ public class BankingService {
 
     private TransactionResponse replay(BankingTransaction prior, TransferRequest request) {
         if (prior.getTransactionType() != TransactionType.TRANSFER
+                || prior.getLinkId() != null
                 || !request.fromAccountId().equals(prior.getSourceAccountId())
                 || !request.toAccountId().equals(prior.getDestinationAccountId())
                 || request.amount().compareTo(prior.getAmount()) != 0)

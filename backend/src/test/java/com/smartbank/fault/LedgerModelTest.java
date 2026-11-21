@@ -23,8 +23,8 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Model-based randomized testing. Random sequences of operations (deposits,
- * withdrawals, transfers, exact retries, conflicting key reuse, holds and their
- * post/void/expiry) run against PostgreSQL. A small in-memory model, written
+ * withdrawals, transfers, linked transfers, exact retries, conflicting key reuse,
+ * holds and their post/void/expiry) run against PostgreSQL. A small in-memory model, written
  * independently of the service code, predicts each outcome and every balance.
  * After each operation the outcome and all balances must match the model; at the
  * end of each sequence the ledger must reconcile.
@@ -54,10 +54,13 @@ class LedgerModelTest {
 
     enum Outcome { OK, REJECTED, NOT_FOUND }
 
-    sealed interface Op permits Deposit, Withdraw, Transfer, CreateHold, PostHold, VoidHold, ExpireHold { }
+    sealed interface Op permits Deposit, Withdraw, Transfer, Linked, CreateHold, PostHold, VoidHold, ExpireHold { }
     record Deposit(int account, BigDecimal amount, String key) implements Op { }
     record Withdraw(int account, BigDecimal amount, String key) implements Op { }
     record Transfer(int from, int to, BigDecimal amount, String key) implements Op { }
+    record Leg(int from, int to, BigDecimal amount) { }
+    /** A linked transfer: every leg posts or none does. */
+    record Linked(List<Leg> legs, String key) implements Op { }
     record CreateHold(int from, int to, BigDecimal amount, String key) implements Op { }
     /** amount null posts the full hold. Holds are referred to by their creation key. */
     record PostHold(String holdKey, BigDecimal amount) implements Op { }
@@ -116,6 +119,23 @@ class LedgerModelTest {
                     moneyKeys.put(t.key(), t);
                     return Outcome.OK;
                 }
+                case Linked l -> {
+                    if (l.legs().stream().anyMatch(leg -> leg.from() == leg.to())) return Outcome.REJECTED;
+                    Op prior = moneyKeys.get(l.key());
+                    if (prior != null) return sameRequest(prior, l) ? Outcome.OK : Outcome.REJECTED;
+                    // Funds are checked on each account's net change across the group.
+                    BigDecimal[] net = new BigDecimal[ACCOUNTS];
+                    Arrays.fill(net, BigDecimal.ZERO);
+                    for (Leg leg : l.legs()) {
+                        net[leg.from()] = net[leg.from()].subtract(leg.amount());
+                        net[leg.to()] = net[leg.to()].add(leg.amount());
+                    }
+                    for (int a = 0; a < ACCOUNTS; a++)
+                        if (net[a].signum() < 0 && available(a).compareTo(net[a].negate()) < 0) return Outcome.REJECTED;
+                    for (int a = 0; a < ACCOUNTS; a++) balance[a] = balance[a].add(net[a]);
+                    moneyKeys.put(l.key(), l);
+                    return Outcome.OK;
+                }
                 case CreateHold c -> {
                     if (c.from() == c.to()) return Outcome.REJECTED;
                     ModelHold prior = holdsByKey.get(c.key());
@@ -164,6 +184,14 @@ class LedgerModelTest {
             pendingCredits[h.create.to()] = pendingCredits[h.create.to()].subtract(h.create.amount());
         }
 
+        private static boolean sameLegs(List<Leg> a, List<Leg> b) {
+            if (a.size() != b.size()) return false;
+            for (int i = 0; i < a.size(); i++)
+                if (a.get(i).from() != b.get(i).from() || a.get(i).to() != b.get(i).to()
+                        || a.get(i).amount().compareTo(b.get(i).amount()) != 0) return false;
+            return true;
+        }
+
         /** Same operation type and parameters: amounts compared by value. */
         private static boolean sameRequest(Op a, Op b) {
             return switch (a) {
@@ -171,6 +199,7 @@ class LedgerModelTest {
                 case Withdraw x when b instanceof Withdraw y -> x.account() == y.account() && x.amount().compareTo(y.amount()) == 0;
                 case Transfer x when b instanceof Transfer y -> x.from() == y.from() && x.to() == y.to() && x.amount().compareTo(y.amount()) == 0;
                 case CreateHold x when b instanceof CreateHold y -> x.from() == y.from() && x.to() == y.to() && x.amount().compareTo(y.amount()) == 0;
+                case Linked x when b instanceof Linked y -> sameLegs(x.legs(), y.legs());
                 default -> false;
             };
         }
@@ -198,8 +227,16 @@ class LedgerModelTest {
                 op = new Deposit(a, amount, key);
             } else if (kind < 37) {
                 op = new Withdraw(a, amount, key);
-            } else if (kind < 57) {
+            } else if (kind < 50) {
                 op = new Transfer(a, b, amount, key);  // a == b sometimes, which must be rejected
+            } else if (kind < 57) {
+                List<Leg> legs = new ArrayList<>();
+                for (int n = r.nextInt(2, 5); n > 0; n--) {
+                    int from = r.nextInt(ACCOUNTS), to = r.nextInt(ACCOUNTS);
+                    if (from == to && r.nextInt(4) != 0) to = (to + 1) % ACCOUNTS;  // mostly valid legs
+                    legs.add(new Leg(from, to, BigDecimal.valueOf(r.nextInt(1, 8_001), 2)));
+                }
+                op = new Linked(legs, key);
             } else if (kind < 70) {
                 CreateHold c = r.nextInt(8) == 0 && !holdOps.isEmpty()
                         ? holdOps.get(r.nextInt(holdOps.size()))  // retry of a hold
@@ -216,7 +253,7 @@ class LedgerModelTest {
                     default -> new ExpireHold(holdKey);
                 };
             }
-            if (op instanceof Deposit || op instanceof Withdraw || op instanceof Transfer) moneyOps.add(op);
+            if (op instanceof Deposit || op instanceof Withdraw || op instanceof Transfer || op instanceof Linked) moneyOps.add(op);
             ops.add(op);
         }
         return ops;
@@ -227,6 +264,7 @@ class LedgerModelTest {
             case Deposit d -> d.key();
             case Withdraw w -> w.key();
             case Transfer t -> t.key();
+            case Linked l -> l.key();
             default -> throw new IllegalArgumentException(op.toString());
         };
     }
@@ -280,6 +318,9 @@ class LedgerModelTest {
             case Deposit d -> banking.deposit(ids.get(d.account()), new MoneyRequest(d.amount(), d.key()));
             case Withdraw w -> banking.withdraw(ids.get(w.account()), new MoneyRequest(w.amount(), w.key()));
             case Transfer t -> banking.transfer(new TransferRequest(ids.get(t.from()), ids.get(t.to()), t.amount(), t.key()));
+            case Linked l -> banking.linkedTransfer(new LinkedTransferRequest(l.legs().stream()
+                    .map(leg -> new LinkedTransferRequest.Leg(ids.get(leg.from()), ids.get(leg.to()), leg.amount()))
+                    .toList(), l.key()));
             case CreateHold c -> holdIds.put(c.key(), holds.create(new CreateHoldRequest(
                     ids.get(c.from()), ids.get(c.to()), c.amount(), c.key(), null)).id());
             case PostHold p -> holds.post(holdId(p.holdKey(), holdIds), p.amount());

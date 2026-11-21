@@ -6,6 +6,7 @@ import java.util.Optional;
 import java.util.UUID;
 public interface BankingTransactionRepository extends JpaRepository<BankingTransaction, UUID> {
     Optional<BankingTransaction> findByRequestKey(String requestKey);
+    List<BankingTransaction> findByLinkIdOrderByLinkIndex(UUID linkId);
     List<BankingTransaction> findBySourceAccountIdOrDestinationAccountIdOrderByCreatedAtDesc(
         UUID sourceAccountId, UUID destinationAccountId, Pageable pageable);
 }
