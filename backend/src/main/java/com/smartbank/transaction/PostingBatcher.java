@@ -20,27 +20,30 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Group commit for transfers. Concurrent transfer requests queue up; a worker takes
- * everything queued (up to a maximum) and posts it in one database transaction:
+ * Group commit for transfers, deposits and withdrawals. Concurrent requests queue
+ * up; a worker takes everything queued (up to a maximum) and posts it in one
+ * database transaction:
  *
  * 1. Look up all request keys in one query; committed ones are replayed.
  * 2. Lock every account the batch touches with one
  *    {@code SELECT … ORDER BY id FOR NO KEY UPDATE}, in {@link UuidOrder}, the same
  *    order every other path uses.
- * 3. Decide each transfer in arrival order against the locked balances, as if they
- *    ran one after another. A rejected transfer (insufficient funds, unknown account,
- *    different currencies) gets its own error and does not affect the others.
- * 4. Write all accepted transfers, their ledger entries, events and webhook
+ * 3. Decide each posting in arrival order against the locked balances, as if they
+ *    ran one after another: a deposit needs its account to exist, a withdrawal needs
+ *    available funds, a transfer needs both accounts, one currency and funds. A
+ *    rejected posting gets its own error and does not affect the others, and a
+ *    withdrawal can use money deposited earlier in the same batch.
+ * 4. Write all accepted postings, their ledger entries, events and webhook
  *    deliveries in one statement, and the net balance change per account in one
  *    batch.
  * 5. Commit, then answer every caller. A caller hears "success" only after commit.
  *
- * About five round trips per batch instead of about six per transfer, and a busy
- * account's row lock is taken once per batch instead of once per transfer.
+ * About five round trips per batch instead of about six per posting, and a busy
+ * account's row lock is taken once per batch instead of once per posting.
  *
  * If the batch fails as a whole because another path inserted one of its request
  * keys at the same moment, or the batch lost a deadlock with such a path, each
- * transfer is retried on the unbatched path, which replays or posts it. Any other failure (for example a lost connection) is
+ * posting is retried on the unbatched path, which replays or posts it. Any other failure (for example a lost connection) is
  * returned to every caller; retrying with the same key is safe.
  *
  * Batches form naturally: while a worker posts one batch, new requests queue for
@@ -48,10 +51,32 @@ import java.util.concurrent.atomic.AtomicLong;
  * optional linger waits a little longer for more requests.
  */
 @Component
-public class TransferBatcher {
-    private static final Logger log = LoggerFactory.getLogger(TransferBatcher.class);
+public class PostingBatcher {
+    private static final Logger log = LoggerFactory.getLogger(PostingBatcher.class);
 
-    record Pending(TransferRequest request, CompletableFuture<TransactionResponse> result) { }
+    /**
+     * One deposit (from null), withdrawal (to null) or transfer (both set), with its
+     * request key.
+     */
+    record Posting(TransactionType type, UUID from, UUID to, BigDecimal amount, String key) {
+        static Posting transfer(TransferRequest r) {
+            return new Posting(TransactionType.TRANSFER, r.fromAccountId(), r.toAccountId(), r.amount(), r.requestKey());
+        }
+        static Posting deposit(UUID account, MoneyRequest r) {
+            return new Posting(TransactionType.DEPOSIT, null, account, r.amount(), r.requestKey());
+        }
+        static Posting withdrawal(UUID account, MoneyRequest r) {
+            return new Posting(TransactionType.WITHDRAWAL, account, null, r.amount(), r.requestKey());
+        }
+        /** The account a single-account posting is about. */
+        UUID account() { return type == TransactionType.DEPOSIT ? to : from; }
+        boolean sameAs(Posting o) {
+            return type == o.type && java.util.Objects.equals(from, o.from) && java.util.Objects.equals(to, o.to)
+                    && amount.compareTo(o.amount) == 0;
+        }
+    }
+
+    record Pending(Posting posting, CompletableFuture<TransactionResponse> result) { }
 
     private final BankingService banking;
     private final AccountRepository accounts;
@@ -67,7 +92,7 @@ public class TransferBatcher {
 
     private final AtomicLong batches = new AtomicLong(), transfers = new AtomicLong(), fallbacks = new AtomicLong();
 
-    public TransferBatcher(BankingService banking, AccountRepository accounts,
+    public PostingBatcher(BankingService banking, AccountRepository accounts,
                            BankingTransactionRepository transactions, PostingWriter writer,
                            TransactionTemplate transactionTemplate,
                            @Value("${smartbank.batching.workers:2}") int workerCount,
@@ -83,15 +108,15 @@ public class TransferBatcher {
         this.lingerNanos = linger.toNanos();
         this.callerTimeout = callerTimeout;
         for (int i = 0; i < workerCount; i++) {
-            Thread worker = Thread.ofPlatform().name("transfer-batcher-" + i).daemon().start(this::work);
+            Thread worker = Thread.ofPlatform().name("posting-batcher-" + i).daemon().start(this::work);
             workers.add(worker);
         }
     }
 
-    /** Queues the transfer and waits for its batch to commit. */
-    public TransactionResponse submit(TransferRequest request) {
-        Pending pending = new Pending(request, new CompletableFuture<>());
-        if (!running) throw new IllegalStateException("Transfer batcher is stopped");
+    /** Queues the posting and waits for its batch to commit. */
+    public TransactionResponse submit(Posting posting) {
+        Pending pending = new Pending(posting, new CompletableFuture<>());
+        if (!running) throw new IllegalStateException("Posting batcher is stopped");
         queue.add(pending);
         try {
             return pending.result().get(callerTimeout.toMillis(), TimeUnit.MILLISECONDS);
@@ -100,10 +125,10 @@ public class TransferBatcher {
             throw new IllegalStateException(e.getCause());
         } catch (TimeoutException e) {
             // The transfer may still commit; a retry with the same key will find out.
-            throw new IllegalStateException("Timed out waiting for the transfer's batch to commit");
+            throw new IllegalStateException("Timed out waiting for the batch to commit");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while waiting for the transfer's batch");
+            throw new IllegalStateException("Interrupted while waiting for the batch");
         }
     }
 
@@ -134,7 +159,7 @@ public class TransferBatcher {
                 Thread.currentThread().interrupt();
                 return;
             } catch (RuntimeException e) {
-                log.error("Transfer batch worker error", e);
+                log.error("Posting batch worker error", e);
             }
         }
     }
@@ -149,11 +174,11 @@ public class TransferBatcher {
         } catch (DataIntegrityViolationException | ConcurrencyFailureException e) {
             // Another path inserted one of these request keys concurrently, or the batch lost a deadlock
             // with such a path (it locks accounts before inserting keys; the direct path does the
-            // reverse). Settle each transfer on its own: the contested one is replayed, the others post.
+            // reverse). Settle each posting on its own: the contested one is replayed, the others post.
             fallbacks.incrementAndGet();
             for (Pending p : batch) {
                 try {
-                    p.result().complete(banking.transferDirect(p.request()));
+                    p.result().complete(direct(p.posting()));
                 } catch (RuntimeException ex) {
                     p.result().completeExceptionally(ex);
                 }
@@ -175,62 +200,69 @@ public class TransferBatcher {
         static Outcome failed(RuntimeException e) { return new Outcome(null, e); }
     }
 
+    private TransactionResponse direct(Posting p) {
+        return switch (p.type()) {
+            case TRANSFER -> banking.transferDirect(new TransferRequest(p.from(), p.to(), p.amount(), p.key()));
+            case DEPOSIT -> banking.depositDirect(p.to(), new MoneyRequest(p.amount(), p.key()));
+            case WITHDRAWAL -> banking.withdrawDirect(p.from(), new MoneyRequest(p.amount(), p.key()));
+            default -> throw new IllegalArgumentException("Not batchable: " + p.type());
+        };
+    }
+
     private Map<Pending, Outcome> postBatch(List<Pending> batch) {
         Map<Pending, Outcome> outcomes = new LinkedHashMap<>();
 
         // 1. Request keys already committed are replays.
         Map<String, BankingTransaction> committed = new HashMap<>();
-        transactions.findByRequestKeyIn(batch.stream().map(p -> p.request().requestKey()).distinct().toList())
+        transactions.findByRequestKeyIn(batch.stream().map(p -> p.posting().key()).distinct().toList())
                 .forEach(tx -> committed.put(tx.getRequestKey(), tx));
 
-        // 2. Lock every account the new transfers touch, in the shared lock order.
+        // 2. Lock every account the new postings touch, in the shared lock order.
         Set<UUID> ids = new TreeSet<>(UuidOrder.COMPARATOR);
         for (Pending p : batch)
-            if (!committed.containsKey(p.request().requestKey())) {
-                ids.add(p.request().fromAccountId());
-                ids.add(p.request().toAccountId());
+            if (!committed.containsKey(p.posting().key())) {
+                if (p.posting().from() != null) ids.add(p.posting().from());
+                if (p.posting().to() != null) ids.add(p.posting().to());
             }
         Map<UUID, Account> locked = new HashMap<>();
         if (!ids.isEmpty()) accounts.lockAllInOrder(ids).forEach(a -> locked.put(a.getId(), a));
         Map<UUID, BigDecimal> available = new HashMap<>();
         locked.values().forEach(a -> available.put(a.getId(), a.getAvailableBalance()));
 
-        // 3. Decide each transfer in arrival order.
+        // 3. Decide each posting in arrival order.
         Map<UUID, BigDecimal> net = new TreeMap<>(UuidOrder.COMPARATOR);
         List<BankingTransaction> rows = new ArrayList<>();
         List<Pending> accepted = new ArrayList<>();
         Map<String, Pending> acceptedByKey = new HashMap<>();
         List<Pending> followers = new ArrayList<>();
         for (Pending p : batch) {
-            TransferRequest r = p.request();
-            BankingTransaction prior = committed.get(r.requestKey());
+            Posting r = p.posting();
+            BankingTransaction prior = committed.get(r.key());
             if (prior != null) {
                 outcomes.put(p, replay(prior, r));
                 continue;
             }
-            if (acceptedByKey.containsKey(r.requestKey())) {
-                followers.add(p);  // same key as an earlier transfer in this batch
+            if (acceptedByKey.containsKey(r.key())) {
+                followers.add(p);  // same key as an earlier posting in this batch
                 continue;
             }
-            Account source = locked.get(r.fromAccountId()), target = locked.get(r.toAccountId());
-            if (source == null) { outcomes.put(p, Outcome.failed(new AccountNotFoundException(r.fromAccountId()))); continue; }
-            if (target == null) { outcomes.put(p, Outcome.failed(new AccountNotFoundException(r.toAccountId()))); continue; }
-            if (!source.getCurrency().equals(target.getCurrency())) {
-                outcomes.put(p, Outcome.failed(new BankingException("Cross-currency transfers are not supported")));
+            RuntimeException rejection = check(r, locked, available);
+            if (rejection != null) {
+                outcomes.put(p, Outcome.failed(rejection));
                 continue;
             }
-            if (available.get(r.fromAccountId()).compareTo(r.amount()) < 0) {
-                outcomes.put(p, Outcome.failed(new BankingException("Insufficient funds")));
-                continue;
+            if (r.from() != null) {
+                available.merge(r.from(), r.amount().negate(), BigDecimal::add);
+                net.merge(r.from(), r.amount().negate(), BigDecimal::add);
             }
-            available.merge(r.fromAccountId(), r.amount().negate(), BigDecimal::add);
-            available.merge(r.toAccountId(), r.amount(), BigDecimal::add);
-            net.merge(r.fromAccountId(), r.amount().negate(), BigDecimal::add);
-            net.merge(r.toAccountId(), r.amount(), BigDecimal::add);
-            rows.add(new BankingTransaction(TransactionType.TRANSFER, r.fromAccountId(), r.toAccountId(),
-                    r.amount(), source.getCurrency(), r.requestKey()));
+            if (r.to() != null) {
+                available.merge(r.to(), r.amount(), BigDecimal::add);
+                net.merge(r.to(), r.amount(), BigDecimal::add);
+            }
+            String currency = locked.get(r.from() != null ? r.from() : r.to()).getCurrency();
+            rows.add(new BankingTransaction(r.type(), r.from(), r.to(), r.amount(), currency, r.key()));
             accepted.add(p);
-            acceptedByKey.put(r.requestKey(), p);
+            acceptedByKey.put(r.key(), p);
         }
 
         // 4. One statement for all postings, one batch for all balance changes.
@@ -246,25 +278,35 @@ public class TransferBatcher {
                 if (!ok) throw new IllegalStateException("Balance check failed on locked accounts");
         }
         for (Pending f : followers) {
-            Pending leader = acceptedByKey.get(f.request().requestKey());
-            outcomes.put(f, sameTransfer(leader.request(), f.request())
+            Pending leader = acceptedByKey.get(f.posting().key());
+            outcomes.put(f, leader.posting().sameAs(f.posting())
                     ? outcomes.get(leader)
                     : Outcome.failed(new BankingException("Request key was already used for a different operation")));
         }
         return outcomes;
     }
 
-    private Outcome replay(BankingTransaction prior, TransferRequest request) {
+    /** Why the posting cannot be accepted given the balances so far, or null if it can. */
+    private static RuntimeException check(Posting r, Map<UUID, Account> locked, Map<UUID, BigDecimal> available) {
+        Account source = r.from() == null ? null : locked.get(r.from());
+        Account target = r.to() == null ? null : locked.get(r.to());
+        if (r.from() != null && source == null) return new AccountNotFoundException(r.from());
+        if (r.to() != null && target == null) return new AccountNotFoundException(r.to());
+        if (source != null && target != null && !source.getCurrency().equals(target.getCurrency()))
+            return new BankingException("Cross-currency transfers are not supported");
+        if (source != null && available.get(r.from()).compareTo(r.amount()) < 0)
+            return new BankingException("Insufficient funds");
+        return null;
+    }
+
+    private Outcome replay(BankingTransaction prior, Posting r) {
         try {
-            return Outcome.ok(banking.replayTransfer(prior, request));
+            return Outcome.ok(r.type() == TransactionType.TRANSFER
+                    ? banking.replayTransfer(prior, new TransferRequest(r.from(), r.to(), r.amount(), r.key()))
+                    : banking.replaySingle(prior, r.type(), r.account(), r.amount()));
         } catch (BankingException e) {
             return Outcome.failed(e);
         }
-    }
-
-    private static boolean sameTransfer(TransferRequest a, TransferRequest b) {
-        return a.fromAccountId().equals(b.fromAccountId()) && a.toAccountId().equals(b.toAccountId())
-                && a.amount().compareTo(b.amount()) == 0;
     }
 
     @PreDestroy
@@ -273,6 +315,6 @@ public class TransferBatcher {
         workers.forEach(Thread::interrupt);
         List<Pending> left = new ArrayList<>();
         queue.drainTo(left);
-        left.forEach(p -> p.result().completeExceptionally(new IllegalStateException("Transfer batcher stopped")));
+        left.forEach(p -> p.result().completeExceptionally(new IllegalStateException("Posting batcher stopped")));
     }
 }

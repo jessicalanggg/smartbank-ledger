@@ -21,18 +21,18 @@ import java.util.concurrent.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Group commit, batch by batch. Tests hand the batcher an explicit batch, so the
+ * Group commit, batch by batch, for transfers, deposits and withdrawals. Tests hand the batcher an explicit batch, so the
  * order of transfers inside it is known.
  */
 @ActiveProfiles("test")
 @Testcontainers
 @SpringBootTest
-class TransferBatcherTest {
+class PostingBatcherTest {
     @Container
     @ServiceConnection
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17-alpine");
 
-    @Autowired TransferBatcher batcher;
+    @Autowired PostingBatcher batcher;
     @Autowired BankingService banking;
     @Autowired JdbcTemplate jdbc;
     @Autowired LedgerReconciliation reconciliation;
@@ -48,8 +48,18 @@ class TransferBatcherTest {
                 new BigDecimal(balance), "CAD");
     }
 
-    private static TransferBatcher.Pending pending(UUID from, UUID to, String amount, String key) {
-        return new TransferBatcher.Pending(new TransferRequest(from, to, new BigDecimal(amount), key),
+    private static PostingBatcher.Pending pending(UUID from, UUID to, String amount, String key) {
+        return new PostingBatcher.Pending(PostingBatcher.Posting.transfer(new TransferRequest(from, to, new BigDecimal(amount), key)),
+                new CompletableFuture<>());
+    }
+
+    private static PostingBatcher.Pending deposit(UUID account, String amount, String key) {
+        return new PostingBatcher.Pending(PostingBatcher.Posting.deposit(account, new MoneyRequest(new BigDecimal(amount), key)),
+                new CompletableFuture<>());
+    }
+
+    private static PostingBatcher.Pending withdrawal(UUID account, String amount, String key) {
+        return new PostingBatcher.Pending(PostingBatcher.Posting.withdrawal(account, new MoneyRequest(new BigDecimal(amount), key)),
                 new CompletableFuture<>());
     }
 
@@ -58,7 +68,7 @@ class TransferBatcherTest {
     }
 
     /** Result of one transfer in a processed batch: its response, or the exception class name. */
-    private static Object outcome(TransferBatcher.Pending p) {
+    private static Object outcome(PostingBatcher.Pending p) {
         assertTrue(p.result().isDone(), "Every caller must be answered");
         try {
             return p.result().getNow(null);
@@ -193,6 +203,59 @@ class TransferBatcherTest {
         assertMoney("70.00", balance(a));
         assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM banking_transactions WHERE request_key = ?",
                 Integer.class, contested));
+    }
+
+    @Test
+    void depositsAndWithdrawalsShareBatchesWithTransfers() {
+        UUID a = account("0.00"), b = account("10.00");
+        var depositA = deposit(a, "50.00", key());
+        var withdrawA = withdrawal(a, "30.00", key());       // funded by the deposit just before it
+        var overdraw = withdrawal(b, "10.01", key());        // more than b has
+        var aPaysB = pending(a, b, "20.00", key());          // uses the rest of a's deposit
+        var withdrawB = withdrawal(b, "30.00", key());       // b now has 30.00
+
+        batcher.process(List.of(depositA, withdrawA, overdraw, aPaysB, withdrawB));
+
+        assertEquals("DEPOSIT", ((TransactionResponse) outcome(depositA)).type().name());
+        assertEquals("WITHDRAWAL", ((TransactionResponse) outcome(withdrawA)).type().name());
+        assertEquals("BankingException: Insufficient funds", outcome(overdraw));
+        assertInstanceOf(TransactionResponse.class, outcome(aPaysB));
+        assertInstanceOf(TransactionResponse.class, outcome(withdrawB));
+        assertMoney("0.00", balance(a));
+        assertMoney("0.00", balance(b));
+    }
+
+    @Test
+    void keysAreSharedAcrossPostingTypesInABatch() {
+        UUID a = account("100.00");
+        String k = key();
+        var depositFirst = deposit(a, "10.00", k);
+        var withdrawalSameKey = withdrawal(a, "10.00", k);
+        var depositRetry = deposit(a, "10.00", k);
+
+        batcher.process(List.of(depositFirst, withdrawalSameKey, depositRetry));
+
+        TransactionResponse posted = (TransactionResponse) outcome(depositFirst);
+        assertEquals("BankingException: Request key was already used for a different operation", outcome(withdrawalSameKey));
+        assertEquals(posted, outcome(depositRetry));
+        assertMoney("110.00", balance(a));
+    }
+
+    @Test
+    void committedDepositsAreReplayedAndUnknownAccountsRejectedAlone() {
+        UUID a = account("100.00");
+        String k = key();
+        TransactionResponse earlier = banking.depositDirect(a, new MoneyRequest(new BigDecimal("5.00"), k));
+        var retry = deposit(a, "5.00", k);
+        var unknown = deposit(UUID.randomUUID(), "5.00", key());
+        var fresh = withdrawal(a, "15.00", key());
+
+        batcher.process(List.of(retry, unknown, fresh));
+
+        assertEquals(earlier, outcome(retry));
+        assertTrue(String.valueOf(outcome(unknown)).startsWith(AccountNotFoundException.class.getSimpleName()));
+        assertInstanceOf(TransactionResponse.class, outcome(fresh));
+        assertMoney("90.00", balance(a));
     }
 
     @Test

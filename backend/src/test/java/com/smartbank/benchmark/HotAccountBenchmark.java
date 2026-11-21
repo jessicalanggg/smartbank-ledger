@@ -34,7 +34,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   mvn test -Dtest=HotAccountBenchmark -Dbenchmark=true
  * Optional: -Dbenchmark.threads=32 -Dbenchmark.transfers=4000 -Dbenchmark.runs=3
  * -Dbenchmark.mode=holds measures two-phase transfers instead: each operation creates
- * a hold and posts it.
+ * a hold and posts it. -Dbenchmark.mode=deposits measures deposits into the same
+ * accounts (the hot account being, say, a merchant's collection account).
  *
  * Calls BankingService directly, so it measures locking, the ledger and the
  * database, not HTTP or JWT handling.
@@ -57,6 +58,7 @@ class HotAccountBenchmark {
     @Autowired BankingService banking;
     @Autowired com.smartbank.transaction.HoldService holds;
     private final boolean holdMode = "holds".equals(System.getProperty("benchmark.mode"));
+    private final boolean depositMode = "deposits".equals(System.getProperty("benchmark.mode"));
     @Autowired LedgerReconciliation reconciliation;
     @Autowired JdbcTemplate jdbc;
     @Value("${spring.datasource.hikari.maximum-pool-size:10}") int poolSize;
@@ -88,7 +90,7 @@ class HotAccountBenchmark {
                 | Transfers into hot account | Transfers/s | p50 ms | p95 ms | p99 ms |
                 | --- | --- | --- | --- | --- |
                 %s
-                """.formatted(holdMode ? "hold + post" : "transfer", transfers, threads, poolSize, runs, System.getProperty("benchmark.syncCommit", "on"),
+                """.formatted(holdMode ? "hold + post" : depositMode ? "deposit" : "transfer", transfers, threads, poolSize, runs, System.getProperty("benchmark.syncCommit", "on"),
                 roundTripMs(), commitMs(), sequentialTransferMs(), String.join("\n", rows));
         System.out.println("[benchmark]\n" + table);
         write(table);
@@ -143,7 +145,9 @@ class HotAccountBenchmark {
                     BigDecimal amount = BigDecimal.valueOf(r.nextInt(100, 10_001), 2);
                     long start = System.nanoTime();
                     try {
-                        if (holdMode) {
+                        if (depositMode) {
+                            banking.deposit(to, new com.smartbank.transaction.MoneyRequest(amount, prefix + n));
+                        } else if (holdMode) {
                             var hold = holds.create(new com.smartbank.transaction.CreateHoldRequest(from, to, amount, prefix + n, null));
                             holds.post(hold.id(), null);
                         } else {

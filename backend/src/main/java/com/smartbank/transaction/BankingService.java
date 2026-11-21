@@ -64,13 +64,33 @@ public class BankingService {
      * request commits, then fails; it is then replayed from the committed row.
      */
 
+    /** Posts a deposit, through the batcher when it is enabled. */
     public TransactionResponse deposit(UUID accountId, MoneyRequest request) {
+        requireKey(request.requestKey());
+        return batcher != null ? batcher.submit(PostingBatcher.Posting.deposit(accountId, request))
+                : depositDirect(accountId, request);
+    }
+
+    /** Posts a withdrawal, through the batcher when it is enabled. */
+    public TransactionResponse withdraw(UUID accountId, MoneyRequest request) {
+        requireKey(request.requestKey());
+        return batcher != null ? batcher.submit(PostingBatcher.Posting.withdrawal(accountId, request))
+                : withdrawDirect(accountId, request);
+    }
+
+    private static void requireKey(String key) {
+        if (key == null || key.isBlank()) throw new IllegalArgumentException("A request key is required");
+    }
+
+    /** A deposit in its own transaction, without batching. */
+    TransactionResponse depositDirect(UUID accountId, MoneyRequest request) {
         return idempotent(request.requestKey(),
                 prior -> replay(prior, TransactionType.DEPOSIT, accountId, request.amount()),
                 () -> postSingleAccount(TransactionType.DEPOSIT, accountId, request));
     }
 
-    public TransactionResponse withdraw(UUID accountId, MoneyRequest request) {
+    /** A withdrawal in its own transaction, without batching. */
+    TransactionResponse withdrawDirect(UUID accountId, MoneyRequest request) {
         return idempotent(request.requestKey(),
                 prior -> replay(prior, TransactionType.WITHDRAWAL, accountId, request.amount()),
                 () -> postSingleAccount(TransactionType.WITHDRAWAL, accountId, request));
@@ -87,9 +107,8 @@ public class BankingService {
     public TransactionResponse transfer(TransferRequest request) {
         if (request.fromAccountId().equals(request.toAccountId()))
             throw new BankingException("Source and destination must differ");
-        if (request.requestKey() == null || request.requestKey().isBlank())
-            throw new IllegalArgumentException("A request key is required");
-        return batcher != null ? batcher.submit(request) : transferDirect(request);
+        requireKey(request.requestKey());
+        return batcher != null ? batcher.submit(PostingBatcher.Posting.transfer(request)) : transferDirect(request);
     }
 
     /** Posts a single transfer in its own transaction, without batching. */
@@ -101,10 +120,14 @@ public class BankingService {
         return replay(prior, request);
     }
 
-    private TransferBatcher batcher;
+    TransactionResponse replaySingle(BankingTransaction prior, TransactionType type, UUID accountId, BigDecimal amount) {
+        return replay(prior, type, accountId, amount);
+    }
+
+    private PostingBatcher batcher;
 
     @Autowired(required = false)
-    void setBatcher(@Lazy TransferBatcher batcher,
+    void setBatcher(@Lazy PostingBatcher batcher,
                     @Value("${smartbank.batching.enabled:true}") boolean enabled) {
         this.batcher = enabled ? batcher : null;
     }
