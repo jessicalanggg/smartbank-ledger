@@ -18,6 +18,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Few database round trips.** A transfer writes its transaction, ledger entries, outbox event and webhook deliveries in one SQL statement and both balance updates in one batch: 6 round trips instead of 17, measured with injected network delay ([docs/benchmarks.md](docs/benchmarks.md#round-trips-per-operation)).
 - **Batched posting (group commit).** Concurrent transfers are posted together: one database transaction locks every account in the batch once, decides each transfer in arrival order (a rejected transfer does not fail the others), and writes them all in one statement. With every transfer paying one account, that is about 5–6× the throughput and p99 latency under 80 ms instead of hundreds of milliseconds. Callers are answered only after commit. See [docs/benchmarks.md](docs/benchmarks.md#batched-posting-group-commit).
 - **Benchmarked hot-account throughput.** When every transfer pays one account, this design sustains about 2.6× the throughput of locking both accounts for the whole transfer, with about 10× lower p99 latency (≈540 vs ≈200 transfers/s, p99 under 300 ms vs ≈3 s). See [docs/benchmarks.md](docs/benchmarks.md).
+- **Rate limiting.** Token buckets in PostgreSQL, shared by every app instance, each checked with one atomic statement. Failed logins are limited per email (a successful login gives its token back), and login, registration and unauthenticated requests per IP; authenticated requests per user, with a stricter limit for writes. Refused requests get 429 with `Retry-After`. Unknown emails take as long to reject as wrong passwords, so login timing does not reveal which accounts exist.
 - **Authentication and authorization.** Spring Security with stateless JWT (HS256, 30-minute expiry) and BCrypt password hashing. Users can only read, debit or view the history of accounts they own.
 - **Database-enforced invariants.** Flyway migrations define `CHECK (balance >= 0)`, positive amounts, valid transaction shapes, a `UNIQUE` request key, balanced ledger postings and append-only history, so the database rejects bad states even if application code is wrong.
 - **React frontend** with login, accounts, history, deposits, withdrawals and transfers by account number, including safe retry with the same request key.
@@ -37,6 +38,7 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | Reversal tests | Partial and full refunds by the payee; payer and strangers refused; deposits and withdrawals admin-only; refund needs funds in the payee's account; idempotent retries; reversals, opening balances and unknown ids refused; 40 concurrent partial refunds never exceed the original; the database rejects an over-reversal or a mis-routed one inserted directly |
 | Batch tests | A rejected transfer does not fail its batch; decisions follow arrival order; duplicate keys inside a batch post once; committed keys replay; the same key racing a batch and a single transfer posts once (the deadlock case); concurrent callers share batches |
 | Hold tests | Reservation, full and partial posting, voids, expiry (including a post that arrives after expiry), idempotency, and database rules on hold state changes |
+| Rate-limit tests | Failed logins lock an account while successes do not count; unknown emails behave like real ones; one address cannot spray many accounts; registrations per address; per-user API limits refill; writes have a stricter limit; 200 concurrent requests take exactly the 25 tokens that exist; two app instances share one budget; idle buckets are pruned |
 | Idempotency API tests | Byte-identical replays, per-user scoping, 422 on a different request, stored business errors, keys not consumed by 403/400, expiry and pruning, recovery when the response was never stored, 30 simultaneous retries posting once |
 | Linked transfer tests | Charge/pay/fee flow; one failing leg posts nothing; net funds checks; idempotent retries and 422 on key reuse; caller must own every source; validation. Plus 1,500 concurrent groups of 2–5 legs: every committed group has all its legs, rejected groups none, no deadlocks |
 | Webhook tests (real HTTP receiver) | Events only for committed changes; routing to payer and payee only; signatures verify and reject tampering; retries on schedule; dead-lettering; timeouts; expired leases; 6 concurrent workers deliver 120 events exactly once |
@@ -182,7 +184,7 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 
 Account responses include `balance` (posted), `availableBalance`, `pendingDebits` and `pendingCredits`.
 
-Errors use RFC 9457 problem details: 400 invalid input or a missing idempotency key, 422 an idempotency key reused for a different request, 401 bad credentials, 403 not the owner, 404 unknown account or hold, 409 insufficient funds, conflicting key reuse, a hold that is already final or expired, or another business rule.
+Errors use RFC 9457 problem details: 429 too many requests (with `Retry-After`), 400 invalid input or a missing idempotency key, 422 an idempotency key reused for a different request, 401 bad credentials, 403 not the owner, 404 unknown account or hold, 409 insufficient funds, conflicting key reuse, a hold that is already final or expired, or another business rule.
 
 Example:
 
@@ -205,15 +207,16 @@ Sending the same command again with the same `$KEY` returns the identical respon
 - `backend/src/main/java/com/smartbank/ledger`: ledger entries, posting accounts, reconciliation
 - `backend/src/main/java/com/smartbank/events`: outbox, webhook endpoints, signed delivery worker
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
+- `backend/src/main/java/com/smartbank/ratelimit`: token-bucket limiter, limits, filter
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
 
 ## Limitations and roadmap
 
-Not implemented: refresh tokens or token revocation, rate limiting, MFA, account opening, audit logging, pagination beyond the newest 100 transactions, and cross-currency transfers. The demo password and JWT secret in `infra/compose.yml` are for local use only.
+Not implemented: refresh tokens or token revocation, MFA, account opening, audit logging, pagination beyond the newest 100 transactions, and cross-currency transfers. The demo password and JWT secret in `infra/compose.yml` are for local use only.
 
 Next steps:
 - Re-run the throughput benchmark on a quiet machine after the round-trip and outbox changes, and apply the short-lock design to holds.
