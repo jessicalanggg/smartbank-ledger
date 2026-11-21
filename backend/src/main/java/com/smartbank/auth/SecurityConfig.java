@@ -16,6 +16,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 
 @Configuration
+@org.springframework.boot.context.properties.EnableConfigurationProperties(com.smartbank.ratelimit.RateLimits.class)
 public class SecurityConfig {
     @Bean PasswordEncoder passwordEncoder() { return new BCryptPasswordEncoder(); }
     @Bean JwtDecoder jwtDecoder(@Value("${smartbank.jwt-secret}") String secret) {
@@ -29,7 +30,16 @@ public class SecurityConfig {
             throw new IllegalArgumentException("JWT_SECRET must contain at least 32 UTF-8 bytes");
         return new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
     }
-    @Bean SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    @Bean SecurityFilterChain securityFilterChain(HttpSecurity http,
+            org.springframework.beans.factory.ObjectProvider<com.smartbank.ratelimit.RateLimiter> limiter,
+            org.springframework.beans.factory.ObjectProvider<com.smartbank.ratelimit.RateLimits> limits,
+            com.fasterxml.jackson.databind.ObjectMapper mapper) throws Exception {
+        // Rate limiting runs after the bearer token is validated, so limits follow the user.
+        var rateLimiter = limiter.getIfAvailable();
+        var rateLimits = limits.getIfAvailable();
+        if (rateLimiter != null && rateLimits != null && rateLimits.apiPerUser() != null)
+            http.addFilterAfter(new com.smartbank.ratelimit.RateLimitFilter(rateLimiter, rateLimits, mapper),
+                    org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter.class);
         return http.csrf(csrf -> csrf.disable())
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(a -> a

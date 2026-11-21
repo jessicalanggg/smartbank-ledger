@@ -6,6 +6,8 @@ import org.springframework.security.authentication.BadCredentialsException;
 import com.smartbank.transaction.BankingException;
 import com.smartbank.transaction.HoldNotFoundException;
 import com.smartbank.transaction.TransactionNotFoundException;
+import com.smartbank.ratelimit.RateLimitedException;
+import org.springframework.http.ResponseEntity;
 import com.smartbank.idempotency.IdempotencyKeyMismatchException;
 import com.smartbank.events.WebhookEndpointNotFoundException;
 import com.smartbank.idempotency.InvalidIdempotencyKeyException;
@@ -45,6 +47,12 @@ public class ApiExceptionHandler {
     @ExceptionHandler(InvalidIdempotencyKeyException.class)
     public ProblemDetail invalidIdempotencyKey(InvalidIdempotencyKeyException ex) {
         return problem(HttpStatus.BAD_REQUEST, "Invalid idempotency key", ex.getMessage());
+    }
+    @ExceptionHandler(RateLimitedException.class)
+    public ResponseEntity<ProblemDetail> rateLimited(RateLimitedException ex) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", String.valueOf(ex.retryAfterSeconds()))
+                .body(problem(HttpStatus.TOO_MANY_REQUESTS, "Too many requests", ex.getMessage()));
     }
     @ExceptionHandler(TransactionNotFoundException.class)
     public ProblemDetail transactionNotFound(TransactionNotFoundException ex) {

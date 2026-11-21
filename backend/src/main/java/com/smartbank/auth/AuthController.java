@@ -11,6 +11,9 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Locale;
+import com.smartbank.ratelimit.RateLimitedException;
+import com.smartbank.ratelimit.RateLimiter;
+import com.smartbank.ratelimit.RateLimits;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
 
 @RestController
@@ -28,11 +31,19 @@ public class AuthController {
     private final UserRepository users;
     private final PasswordEncoder encoder;
     private final JwtEncoder jwt;
+    private final RateLimiter limiter;
+    private final RateLimits limits;
+    /** Checked against for unknown emails, so they take as long as wrong passwords. */
+    private final String dummyHash;
 
-    public AuthController(UserRepository users, PasswordEncoder encoder, JwtEncoder jwt) {
+    public AuthController(UserRepository users, PasswordEncoder encoder, JwtEncoder jwt,
+                          RateLimiter limiter, RateLimits limits) {
         this.users = users;
         this.encoder = encoder;
         this.jwt = jwt;
+        this.limiter = limiter;
+        this.limits = limits;
+        this.dummyHash = encoder.encode("not-a-real-password-" + java.util.UUID.randomUUID());
     }
 
     @PostMapping("/register")
@@ -46,13 +57,26 @@ public class AuthController {
         return token(user);
     }
 
+    /**
+     * Each attempt takes a token from the email's bucket first, so parallel guesses
+     * cannot slip past the limit; a successful login gives it back, so only failures
+     * count. Unknown emails still run a BCrypt check, so response time does not
+     * reveal whether an account exists.
+     */
     @PostMapping("/login")
     public TokenResponse login(@Valid @RequestBody Credentials request) {
         String email = request.email().trim().toLowerCase(Locale.ROOT);
-        AppUser user = users.findByEmail(email).orElseThrow(() -> new BadCredentialsException("Invalid credentials"));
-        if (!encoder.matches(request.password(), user.getPasswordHash()))
+        String bucket = "login-email:" + email;
+        if (limits.enabled()) {
+            var decision = limiter.tryAcquire(bucket, limits.loginPerEmail());
+            if (!decision.allowed()) throw new RateLimitedException(decision.retryAfter());
+        }
+        var user = users.findByEmail(email);
+        boolean valid = encoder.matches(request.password(), user.map(AppUser::getPasswordHash).orElse(dummyHash));
+        if (user.isEmpty() || !valid)
             throw new BadCredentialsException("Invalid credentials");
-        return token(user);
+        if (limits.enabled()) limiter.release(bucket, limits.loginPerEmail());
+        return token(user.get());
     }
 
     private TokenResponse token(AppUser user) {

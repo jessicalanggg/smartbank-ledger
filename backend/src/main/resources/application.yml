@@ -27,3 +27,11 @@ server:
 smartbank:
   jwt-secret: ${JWT_SECRET}
   demo-password: ${DEMO_PASSWORD:}
+  rate-limits:
+    enabled: true
+    login-per-email: { capacity: 5, refill-every: 3m }
+    auth-per-ip: { capacity: 20, refill-every: 3s }
+    register-per-ip: { capacity: 5, refill-every: 12m }
+    anonymous-per-ip: { capacity: 60, refill-every: 1s }
+    api-per-user: { capacity: 100, refill-every: 20ms }
+    writes-per-user: { capacity: 20, refill-every: 100ms }
