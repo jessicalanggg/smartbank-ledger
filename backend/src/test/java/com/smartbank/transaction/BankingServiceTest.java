@@ -52,7 +52,6 @@ class BankingServiceTest {
     private Account account(UUID id, String balance, String currency) {
         Account a = new AccountFixture().make(id, balance, currency);
         when(accounts.findById(id)).thenReturn(Optional.of(a));
-        when(accounts.findLockedById(id)).thenReturn(Optional.of(a));
         fixtures.put(id, a);
         when(accounts.findAllById(anyIterable())).thenAnswer(i -> {
             java.util.List<Account> found = new java.util.ArrayList<>();
@@ -87,7 +86,6 @@ class BankingServiceTest {
         order.verify(writer).applyBalanceChanges(java.util.List.of(
             new PostingWriter.BalanceChange(from, new BigDecimal("-200.00")),
             new PostingWriter.BalanceChange(to, new BigDecimal("200.00"))));
-        verify(accounts, never()).findLockedById(any());
     }
     @Test void creditComesFirstWhenTheDestinationSortsFirst() {
         UUID from = UUID.fromString("22222222-2222-4222-8222-222222222222");

@@ -329,15 +329,6 @@ public class BankingService {
             throw new BankingException("Insufficient funds");
     }
 
-    /** Two accounts locked in UUID order, the order every money-moving path uses. */
-    record LockedPair(Account source, Account target) { }
-
-    LockedPair lockPair(UUID sourceId, UUID targetId) {
-        boolean sourceFirst = UuidOrder.before(sourceId, targetId);
-        Account first = locked(sourceFirst ? sourceId : targetId);
-        Account second = locked(sourceFirst ? targetId : sourceId);
-        return sourceFirst ? new LockedPair(first, second) : new LockedPair(second, first);
-    }
 
     @Transactional(readOnly = true)
     public List<TransactionResponse> history(UUID accountId) {
@@ -370,9 +361,6 @@ public class BankingService {
         return TransactionResponse.from(prior);
     }
 
-    Account locked(UUID id) {
-        return accounts.findLockedById(id).orElseThrow(() -> new AccountNotFoundException(id));
-    }
 
     /**
      * Writes the transaction, its balanced ledger entries and its outbox event. Runs

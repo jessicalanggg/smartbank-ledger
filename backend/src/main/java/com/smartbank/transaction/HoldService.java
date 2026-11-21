@@ -1,39 +1,66 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.Account;
+import com.smartbank.account.AccountNotFoundException;
+import com.smartbank.account.AccountRepository;
+import com.smartbank.common.UuidOrder;
 import com.smartbank.events.EventTypes;
 import com.smartbank.events.OutboxWriter;
+import org.springframework.dao.ConcurrencyFailureException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
- * Two-phase transfers. Lock order everywhere is: hold row first, then the two
- * accounts in UUID order (the same order immediate transfers use), so holds,
- * transfers and the expiry job cannot deadlock with each other.
+ * Two-phase transfers, with account locks held only at the very end.
+ *
+ * - Create: read the accounts without locking, insert the hold and its event, then
+ *   reserve the money with one conditional statement per account (the payer's only
+ *   applies if its available balance covers the hold).
+ * - Post, void, expire: lock the hold row first (it is the hold's own state machine
+ *   and only ever contended by requests for the same hold), write the transfer, the
+ *   hold's new state and the event, then apply every account change (balance and
+ *   pending amounts together) in one batch.
+ *
+ * Account rows are locked in {@link com.smartbank.common.UuidOrder} by that final
+ * batch, as in every other path, and held only until commit.
  *
  * Posting and voiding are idempotent through the hold's state machine: repeating
  * a post with the same amount, or a void, returns the hold as it already is.
+ * Creating is idempotent by request key: a simultaneous identical request waits on
+ * the unique key and is then replayed.
  */
 @Service
 public class HoldService {
     static final Duration DEFAULT_TTL = Duration.ofDays(7);
+    private static final int MAX_DEADLOCK_RETRIES = 3;
 
     private final HoldRepository holds;
     private final BankingService banking;
+    private final AccountRepository accounts;
+    private final PostingWriter writer;
     private final OutboxWriter outbox;
+    private final TransactionTemplate transactionTemplate;
     private final Clock clock;
 
-    public HoldService(HoldRepository holds, BankingService banking, OutboxWriter outbox, Clock clock) {
+    public HoldService(HoldRepository holds, BankingService banking, AccountRepository accounts, PostingWriter writer,
+                       OutboxWriter outbox, TransactionTemplate transactionTemplate, Clock clock) {
         this.holds = holds;
         this.banking = banking;
+        this.accounts = accounts;
+        this.writer = writer;
         this.outbox = outbox;
+        this.transactionTemplate = transactionTemplate;
         this.clock = clock;
     }
 
@@ -44,30 +71,50 @@ public class HoldService {
         return response;
     }
 
-    @Transactional
     public HoldResponse create(CreateHoldRequest request) {
         if (request.requestKey() == null || request.requestKey().isBlank())
             throw new IllegalArgumentException("A request key is required");
         if (request.fromAccountId().equals(request.toAccountId()))
             throw new BankingException("Source and destination must differ");
-        var previous = holds.findByRequestKey(request.requestKey());
-        if (previous.isPresent())
-            return replay(previous.get(), request);
-        var accounts = banking.lockPair(request.fromAccountId(), request.toAccountId());
-        // Re-check under the account locks: a simultaneous identical request has committed by now.
-        previous = holds.findByRequestKey(request.requestKey());
-        if (previous.isPresent())
-            return replay(previous.get(), request);
-        Account source = accounts.source(), target = accounts.target();
+        for (int attempt = 1; ; attempt++) {
+            var previous = holds.findByRequestKey(request.requestKey());
+            if (previous.isPresent())
+                return replay(previous.get(), request);
+            try {
+                return transactionTemplate.execute(status -> insertHold(request));
+            } catch (DataIntegrityViolationException e) {
+                // A simultaneous request with the same key committed first.
+                var winner = holds.findByRequestKey(request.requestKey());
+                if (winner.isPresent()) return replay(winner.get(), request);
+                throw e;
+            } catch (ConcurrencyFailureException e) {
+                if (attempt >= MAX_DEADLOCK_RETRIES) throw e;
+            }
+        }
+    }
+
+    private HoldResponse insertHold(CreateHoldRequest request) {
+        UUID from = request.fromAccountId(), to = request.toAccountId();
+        Map<UUID, Account> found = new HashMap<>();
+        accounts.findAllById(List.of(from, to)).forEach(a -> found.put(a.getId(), a));
+        Account source = found.get(from), target = found.get(to);
+        if (source == null) throw new AccountNotFoundException(from);
+        if (target == null) throw new AccountNotFoundException(to);
         if (!source.getCurrency().equals(target.getCurrency()))
             throw new BankingException("Cross-currency holds are not supported");
-        source.reserveDebit(request.amount());
-        target.reserveCredit(request.amount());
+        if (source.getAvailableBalance().compareTo(request.amount()) < 0)
+            throw new BankingException("Insufficient funds");  // fast fail on an unlocked read
         Instant now = now();
-        Duration ttl = request.expiresInSeconds() == null
-                ? DEFAULT_TTL : Duration.ofSeconds(request.expiresInSeconds());
-        return publish(EventTypes.HOLD_CREATED, holds.saveAndFlush(new Hold(source.getId(), target.getId(),
-                request.amount(), source.getCurrency(), request.requestKey(), now, now.plus(ttl))));
+        Duration ttl = request.expiresInSeconds() == null ? DEFAULT_TTL : Duration.ofSeconds(request.expiresInSeconds());
+        Hold hold = holds.saveAndFlush(new Hold(from, to, request.amount(), source.getCurrency(),
+                request.requestKey(), now, now.plus(ttl)));
+        HoldResponse response = publish(EventTypes.HOLD_CREATED, hold);
+        // Critical section: reserve last.
+        boolean[] applied = apply(
+                new PostingWriter.AccountChange(from, BigDecimal.ZERO, request.amount(), BigDecimal.ZERO),
+                new PostingWriter.AccountChange(to, BigDecimal.ZERO, BigDecimal.ZERO, request.amount()));
+        if (!applied[0]) throw new BankingException("Insufficient funds");
+        return response;
     }
 
     /** Posts the hold, in full when amount is null, releasing any remainder. */
@@ -86,24 +133,24 @@ public class HoldService {
         }
         if (amount.compareTo(hold.getAmount()) > 0)
             throw new BankingException("Cannot post more than the held amount");
-        var accounts = banking.lockPair(hold.getSourceAccountId(), hold.getDestinationAccountId());
         Instant now = now();
         if (hold.isExpiredAt(now)) {
             // Commit the expiry (noRollbackFor) so the reservation is released either way.
-            release(hold, accounts);
             hold.markExpired(now);
             holds.flush();
             publish(EventTypes.HOLD_EXPIRED, hold);
+            release(hold);
             throw new HoldExpiredException();
         }
-        release(hold, accounts);
-        accounts.source().debit(amount);
-        accounts.target().credit(amount);
         TransactionResponse tx = banking.record(TransactionType.TRANSFER, hold.getSourceAccountId(),
                 hold.getDestinationAccountId(), amount, hold.getCurrency(), null);
         hold.markPosted(amount, tx.id(), now);
         holds.flush();
-        return publish(EventTypes.HOLD_POSTED, hold);
+        HoldResponse response = publish(EventTypes.HOLD_POSTED, hold);
+        // Critical section: release the reservation and move the posted amount, in one batch.
+        apply(new PostingWriter.AccountChange(hold.getSourceAccountId(), amount.negate(), hold.getAmount().negate(), BigDecimal.ZERO),
+              new PostingWriter.AccountChange(hold.getDestinationAccountId(), amount, BigDecimal.ZERO, hold.getAmount().negate()));
+        return response;
     }
 
     @Transactional
@@ -114,11 +161,11 @@ public class HoldService {
             case POSTED -> throw new BankingException("Hold was already posted");
             case PENDING -> { }
         }
-        var accounts = banking.lockPair(hold.getSourceAccountId(), hold.getDestinationAccountId());
-        release(hold, accounts);
         hold.markVoided(now());
         holds.flush();
-        return publish(EventTypes.HOLD_VOIDED, hold);
+        HoldResponse response = publish(EventTypes.HOLD_VOIDED, hold);
+        release(hold);
+        return response;
     }
 
     /** Expires one hold if it is still pending and due. Each call is its own transaction. */
@@ -126,12 +173,27 @@ public class HoldService {
     public boolean expire(UUID holdId, Instant now) {
         Hold hold = lockedHold(holdId);
         if (hold.getStatus() != HoldStatus.PENDING || !hold.isExpiredAt(now)) return false;
-        var accounts = banking.lockPair(hold.getSourceAccountId(), hold.getDestinationAccountId());
-        release(hold, accounts);
         hold.markExpired(now);
         holds.flush();
         publish(EventTypes.HOLD_EXPIRED, hold);
+        release(hold);
         return true;
+    }
+
+    /** Releases the hold's reservation on both accounts; the last step of the transaction. */
+    private void release(Hold hold) {
+        apply(new PostingWriter.AccountChange(hold.getSourceAccountId(), BigDecimal.ZERO, hold.getAmount().negate(), BigDecimal.ZERO),
+              new PostingWriter.AccountChange(hold.getDestinationAccountId(), BigDecimal.ZERO, BigDecimal.ZERO, hold.getAmount().negate()));
+    }
+
+    /**
+     * Applies the payer's and payee's changes in the shared lock order, in one round
+     * trip. Returns {payer applied, payee applied}.
+     */
+    private boolean[] apply(PostingWriter.AccountChange payer, PostingWriter.AccountChange payee) {
+        boolean payerFirst = UuidOrder.before(payer.accountId(), payee.accountId());
+        boolean[] applied = writer.applyAccountChanges(payerFirst ? List.of(payer, payee) : List.of(payee, payer));
+        return payerFirst ? applied : new boolean[] { applied[1], applied[0] };
     }
 
     @Transactional(readOnly = true)
@@ -158,10 +220,6 @@ public class HoldService {
         return holds.findLockedById(holdId).orElseThrow(() -> new HoldNotFoundException(holdId));
     }
 
-    private static void release(Hold hold, BankingService.LockedPair accounts) {
-        accounts.source().releaseDebit(hold.getAmount());
-        accounts.target().releaseCredit(hold.getAmount());
-    }
 
     private static HoldResponse replay(Hold prior, CreateHoldRequest request) {
         if (!prior.getSourceAccountId().equals(request.fromAccountId())

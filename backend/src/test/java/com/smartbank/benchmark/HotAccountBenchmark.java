@@ -33,6 +33,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Not part of the normal test run. Run with:
  *   mvn test -Dtest=HotAccountBenchmark -Dbenchmark=true
  * Optional: -Dbenchmark.threads=32 -Dbenchmark.transfers=4000 -Dbenchmark.runs=3
+ * -Dbenchmark.mode=holds measures two-phase transfers instead: each operation creates
+ * a hold and posts it.
  *
  * Calls BankingService directly, so it measures locking, the ledger and the
  * database, not HTTP or JWT handling.
@@ -53,6 +55,8 @@ class HotAccountBenchmark {
             .withCommand("postgres", "-c", "synchronous_commit=" + System.getProperty("benchmark.syncCommit", "on"));
 
     @Autowired BankingService banking;
+    @Autowired com.smartbank.transaction.HoldService holds;
+    private final boolean holdMode = "holds".equals(System.getProperty("benchmark.mode"));
     @Autowired LedgerReconciliation reconciliation;
     @Autowired JdbcTemplate jdbc;
     @Value("${spring.datasource.hikari.maximum-pool-size:10}") int poolSize;
@@ -77,14 +81,14 @@ class HotAccountBenchmark {
             System.out.printf("[benchmark] hot share %.0f%%: %s%n", share * 100, results);
         }
         String table = """
-                Transfers per run: %d, client threads: %d, connection pool: %d, runs per row: %d (median shown)
+                Mode: %s. Operations per run: %d, client threads: %d, connection pool: %d, runs per row: %d (median shown)
                 synchronous_commit: %s. Round trip (SELECT 1): %.2f ms. Single-row insert + commit: %.2f ms.
                 One transfer with no concurrency: %.2f ms.
 
                 | Transfers into hot account | Transfers/s | p50 ms | p95 ms | p99 ms |
                 | --- | --- | --- | --- | --- |
                 %s
-                """.formatted(transfers, threads, poolSize, runs, System.getProperty("benchmark.syncCommit", "on"),
+                """.formatted(holdMode ? "hold + post" : "transfer", transfers, threads, poolSize, runs, System.getProperty("benchmark.syncCommit", "on"),
                 roundTripMs(), commitMs(), sequentialTransferMs(), String.join("\n", rows));
         System.out.println("[benchmark]\n" + table);
         write(table);
@@ -139,7 +143,12 @@ class HotAccountBenchmark {
                     BigDecimal amount = BigDecimal.valueOf(r.nextInt(100, 10_001), 2);
                     long start = System.nanoTime();
                     try {
-                        banking.transfer(new TransferRequest(from, to, amount, prefix + n));
+                        if (holdMode) {
+                            var hold = holds.create(new com.smartbank.transaction.CreateHoldRequest(from, to, amount, prefix + n, null));
+                            holds.post(hold.id(), null);
+                        } else {
+                            banking.transfer(new TransferRequest(from, to, amount, prefix + n));
+                        }
                     } catch (RuntimeException e) {
                         failures.incrementAndGet();
                     }

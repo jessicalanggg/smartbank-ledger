@@ -38,26 +38,4 @@ public class Account {
     public BigDecimal getPendingCredits() { return pendingCredits; }
     /** Posted balance minus money reserved by pending holds; what the owner can spend now. */
     public BigDecimal getAvailableBalance() { return balance.subtract(pendingDebits); }
-
-    public void credit(BigDecimal amount) { balance = balance.add(amount); }
-    public void debit(BigDecimal amount) {
-        if (getAvailableBalance().compareTo(amount) < 0)
-            throw new com.smartbank.transaction.BankingException("Insufficient funds");
-        balance = balance.subtract(amount);
-    }
-
-    /** Reserves money for an outgoing hold. */
-    public void reserveDebit(BigDecimal amount) {
-        if (getAvailableBalance().compareTo(amount) < 0)
-            throw new com.smartbank.transaction.BankingException("Insufficient funds");
-        pendingDebits = pendingDebits.add(amount);
-    }
-    public void releaseDebit(BigDecimal amount) { pendingDebits = requireNonNegative(pendingDebits.subtract(amount)); }
-    public void reserveCredit(BigDecimal amount) { pendingCredits = pendingCredits.add(amount); }
-    public void releaseCredit(BigDecimal amount) { pendingCredits = requireNonNegative(pendingCredits.subtract(amount)); }
-
-    private static BigDecimal requireNonNegative(BigDecimal value) {
-        if (value.signum() < 0) throw new IllegalStateException("Pending amount would become negative");
-        return value;
-    }
 }

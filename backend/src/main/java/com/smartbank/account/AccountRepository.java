@@ -17,14 +17,6 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
     @Query("update Account a set a.ownerUserId = :userId where a.id = :id and a.ownerUserId is null")
     int assignOwnerIfUnassigned(@Param("id") UUID id, @Param("userId") UUID userId);
 
-    /**
-     * Locks the row FOR NO KEY UPDATE rather than FOR UPDATE: it still excludes other
-     * balance changes, but does not conflict with the KEY SHARE locks PostgreSQL takes
-     * when a ledger entry or transaction referencing this account is inserted. With
-     * FOR UPDATE, a hold could deadlock with a transfer that has inserted its entries.
-     */
-    @Query(value = "SELECT * FROM accounts WHERE id = :id FOR NO KEY UPDATE", nativeQuery = true)
-    Optional<Account> findLockedById(@Param("id") UUID id);
 
     /**
      * Locks several accounts in one statement. PostgreSQL applies FOR NO KEY UPDATE

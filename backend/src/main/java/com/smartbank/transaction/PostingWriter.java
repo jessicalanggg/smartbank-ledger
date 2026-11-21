@@ -28,12 +28,15 @@ import java.util.UUID;
 @Component
 public class PostingWriter {
     /**
-     * One statement for debits and credits: a negative delta is a debit and only
-     * applies if the available balance covers it; a positive delta always applies.
+     * One statement for every account change: deltas to the posted balance and to
+     * the pending amounts. It applies only if the available balance afterwards
+     * (balance - pending_debits) is still non-negative, so a debit or a new
+     * reservation that the account cannot cover changes nothing and reports false.
      */
-    private static final String APPLY_DELTA = """
-            UPDATE accounts SET balance = balance + ?, version = version + 1
-            WHERE id = ? AND balance - pending_debits + ? >= 0""";
+    private static final String APPLY_CHANGE = """
+            UPDATE accounts SET balance = balance + ?, pending_debits = pending_debits + ?,
+                pending_credits = pending_credits + ?, version = version + 1
+            WHERE id = ? AND (balance + ?) - (pending_debits + ?) >= 0""";
 
     private final JdbcTemplate jdbc;
     private final OutboxWriter outbox;
@@ -112,13 +115,30 @@ public class PostingWriter {
         return responses;
     }
 
+    /** A change to an account's posted balance and pending amounts. */
+    public record AccountChange(UUID accountId, BigDecimal balance, BigDecimal pendingDebits, BigDecimal pendingCredits) {
+        public static AccountChange balance(UUID accountId, BigDecimal delta) {
+            return new AccountChange(accountId, delta, BigDecimal.ZERO, BigDecimal.ZERO);
+        }
+    }
+
     /** Applies the changes in order, in one round trip; returns whether each one applied. */
     @Transactional(propagation = Propagation.MANDATORY)
     public boolean[] applyBalanceChanges(List<BalanceChange> changes) {
+        return applyAccountChanges(changes.stream().map(c -> AccountChange.balance(c.accountId(), c.delta())).toList());
+    }
+
+    /**
+     * Applies the changes in the given order, in one round trip; returns whether each
+     * one applied. The server runs them in order, so the caller's lock order holds.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public boolean[] applyAccountChanges(List<AccountChange> changes) {
         List<Object[]> batch = changes.stream()
-                .map(c -> new Object[] { c.delta(), c.accountId(), c.delta() })
+                .map(c -> new Object[] { c.balance(), c.pendingDebits(), c.pendingCredits(), c.accountId(),
+                        c.balance(), c.pendingDebits() })
                 .toList();
-        int[] counts = jdbc.batchUpdate(APPLY_DELTA, batch);
+        int[] counts = jdbc.batchUpdate(APPLY_CHANGE, batch);
         boolean[] applied = new boolean[counts.length];
         for (int i = 0; i < counts.length; i++) applied[i] = counts[i] == 1;
         return applied;
