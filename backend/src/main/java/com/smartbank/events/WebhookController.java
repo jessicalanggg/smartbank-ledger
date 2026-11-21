@@ -34,6 +34,23 @@ public class WebhookController {
         endpoints.deactivate(access.currentUserId(), id);
     }
 
+    /** {@code overlapSeconds}: how long the old secret keeps signing (default 24 h, 0 to stop at once). */
+    @PostMapping("/{id}/rotate-secret")
+    public WebhookEndpointService.RotatedSecret rotateSecret(@PathVariable UUID id,
+            @RequestParam(defaultValue = "86400") long overlapSeconds) {
+        return endpoints.rotateSecret(access.currentUserId(), id, java.time.Duration.ofSeconds(overlapSeconds));
+    }
+
+    @PostMapping("/{id}/deliveries/{deliveryId}/resend")
+    public WebhookEndpointService.DeliveryResponse resend(@PathVariable UUID id, @PathVariable UUID deliveryId) {
+        return endpoints.resend(access.currentUserId(), id, deliveryId);
+    }
+
+    @PostMapping("/{id}/deliveries/resend-failed")
+    public java.util.Map<String, Integer> resendFailed(@PathVariable UUID id) {
+        return java.util.Map.of("queued", endpoints.resendFailed(access.currentUserId(), id));
+    }
+
     @GetMapping("/{id}/deliveries")
     public List<WebhookEndpointService.DeliveryResponse> deliveries(@PathVariable UUID id) {
         return endpoints.deliveries(access.currentUserId(), id);

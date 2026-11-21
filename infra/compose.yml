@@ -21,6 +21,10 @@ services:
       DB_USER: smartbank
       DB_PASSWORD: ${DB_PASSWORD:-local_dev_only}
       JWT_SECRET: ${JWT_SECRET:-local_only_jwt_signing_key_change_before_any_deployment_2026}
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY:-local_only_webhook_encryption_key_change_before_deploying_2026}
+      # Local development only: lets webhooks reach a receiver on your machine.
+      WEBHOOK_ALLOW_HTTP: ${WEBHOOK_ALLOW_HTTP:-true}
+      WEBHOOK_ALLOW_PRIVATE_TARGETS: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:-true}
       DEMO_PASSWORD: ${DEMO_PASSWORD:-LocalDemoPass123!}
     ports:
       - "127.0.0.1:8081:8080"

@@ -21,7 +21,18 @@ public final class WebhookSigner {
     private WebhookSigner() { }
 
     public static String signatureHeader(String secret, long timestamp, String body) {
-        return "t=" + timestamp + ",v1=" + hmac(secret, timestamp + "." + body);
+        return signatureHeader(java.util.List.of(secret), timestamp, body);
+    }
+
+    /**
+     * One {@code v1} signature per secret. During a secret rotation both the new and
+     * the old secret sign, so a receiver accepts the request if any {@code v1} matches
+     * the secret it knows.
+     */
+    public static String signatureHeader(java.util.List<String> secrets, long timestamp, String body) {
+        StringBuilder header = new StringBuilder("t=").append(timestamp);
+        for (String secret : secrets) header.append(",v1=").append(hmac(secret, timestamp + "." + body));
+        return header.toString();
     }
 
     public static String hmac(String secret, String message) {

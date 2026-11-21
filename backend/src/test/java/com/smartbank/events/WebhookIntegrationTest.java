@@ -29,6 +29,7 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.Arrays;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -51,7 +52,10 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "smartbank.webhooks.poll-interval=PT1H",
         "smartbank.webhooks.base-backoff=PT10S",
         "smartbank.webhooks.max-attempts=4",
-        "smartbank.webhooks.request-timeout=PT2S"})
+        "smartbank.webhooks.request-timeout=PT2S",
+        // The test receiver listens on 127.0.0.1 over plain http, like local development.
+        "smartbank.webhooks.allow-http=true",
+        "smartbank.webhooks.allow-private-targets=true"})
 @AutoConfigureMockMvc
 class WebhookIntegrationTest {
     @Container
@@ -64,6 +68,8 @@ class WebhookIntegrationTest {
     @Autowired HoldService holds;
     @Autowired WebhookDispatcher dispatcher;
     @Autowired LedgerReconciliation reconciliation;
+    @Autowired SecretCipher cipher;
+    @Autowired WebhookSecretMigrator migrator;
 
     /** A real HTTP receiver: records requests, verifies signatures, can be told to fail. */
     static final class Receiver {
@@ -350,6 +356,108 @@ class WebhookIntegrationTest {
         assertEquals(0, receiver.received.size());
         assertEquals(1, jdbc.queryForObject(
                 "SELECT COUNT(*) FROM webhook_deliveries WHERE endpoint_id = ?::uuid", Integer.class, endpointId));
+    }
+
+    // ---- Hardening: encryption, rotation, resending ---------------------------
+
+    /** Every v1 signature in the header, so tests can check rotation's overlap. */
+    private static List<String> v1s(String header) {
+        return Arrays.stream(header.split(",")).filter(p -> p.startsWith("v1=")).map(p -> p.substring(3)).toList();
+    }
+
+    private static boolean signedBy(String secret, Receiver.Received r) {
+        String t = r.signature().split(",")[0].substring(2);
+        String expected = WebhookSigner.hmac(secret, t + "." + r.body());
+        return v1s(r.signature()).stream().anyMatch(v -> MessageDigest.isEqual(
+                expected.getBytes(StandardCharsets.UTF_8), v.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void secretsAreStoredEncryptedAndBoundToTheirEndpoint() throws Exception {
+        UUID owner = user();
+        String[] first = register(owner, null), second = register(owner, null);
+        var row = jdbc.queryForMap("SELECT secret, secret_encrypted FROM webhook_endpoints WHERE id = ?::uuid", first[0]);
+        assertNull(row.get("secret"), "No plain-text copy");
+        String stored = (String) row.get("secret_encrypted");
+        assertFalse(stored.contains(first[1]));
+        assertEquals(first[1], cipher.decrypt(stored, first[0]));
+        // The ciphertext only decrypts for its own endpoint.
+        assertThrows(IllegalStateException.class, () -> cipher.decrypt(stored, second[0]));
+        // Deliveries are still signed with the original secret.
+        UUID from = account(owner, "10.00");
+        transfer(from, account(user(), "0.00"), "1.00");
+        dispatcher.deliverDue(Instant.now());
+        assertTrue(receiver.received.stream().allMatch(r -> signedBy(first[1], r) || signedBy(second[1], r)));
+    }
+
+    @Test
+    void plainTextSecretsFromBeforeTheUpgradeAreEncryptedAtStartup() {
+        UUID owner = user(), id = UUID.randomUUID();
+        jdbc.update("INSERT INTO webhook_endpoints (id, user_id, url, secret, active, created_at) VALUES (?, ?, ?, 'whsec_legacy', TRUE, now())",
+                id, owner, receiver.url());
+        assertTrue(migrator.encryptPlaintextSecrets() >= 1);
+        var row = jdbc.queryForMap("SELECT secret, secret_encrypted FROM webhook_endpoints WHERE id = ?", id);
+        assertNull(row.get("secret"));
+        assertEquals("whsec_legacy", cipher.decrypt((String) row.get("secret_encrypted"), id.toString()));
+    }
+
+    @Test
+    void rotationSignsWithBothSecretsDuringTheOverlapThenOnlyTheNewOne() throws Exception {
+        UUID owner = user();
+        UUID from = account(owner, "100.00"), to = account(user(), "0.00");
+        String[] endpoint = register(owner, null);
+        String oldSecret = endpoint[1];
+
+        String json = mvc.perform(post("/api/v1/webhook-endpoints/{id}/rotate-secret", endpoint[0])
+                        .param("overlapSeconds", "3600").with(as(owner)))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        String newSecret = JsonPath.read(json, "$.secret");
+        assertNotEquals(oldSecret, newSecret);
+
+        transfer(from, to, "1.00");
+        dispatcher.deliverDue(Instant.now());
+        var during = receiver.received.get(0);
+        assertEquals(2, v1s(during.signature()).size());
+        assertTrue(signedBy(oldSecret, during), "Receivers that still know the old secret keep working");
+        assertTrue(signedBy(newSecret, during));
+
+        transfer(from, to, "1.00");
+        dispatcher.deliverDue(Instant.now().plusSeconds(3601));  // after the overlap
+        var after = receiver.received.get(1);
+        assertEquals(1, v1s(after.signature()).size());
+        assertTrue(signedBy(newSecret, after));
+        assertFalse(signedBy(oldSecret, after));
+    }
+
+    @Test
+    void deadLetteredDeliveriesCanBeResent() throws Exception {
+        UUID owner = user(), stranger = user();
+        UUID from = account(owner, "100.00"), to = account(user(), "0.00");
+        String endpointId = register(owner, null)[0];
+        transfer(from, to, "1.00");
+        transfer(from, to, "2.00");
+        receiver.failuresLeft.set(Integer.MAX_VALUE);
+        Instant t = Instant.now();
+        for (int i = 0; i < 6; i++) { dispatcher.deliverDue(t); t = t.plus(Duration.ofHours(1)); }
+        assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM webhook_deliveries WHERE endpoint_id = ?::uuid AND status = 'FAILED'",
+                Integer.class, endpointId));
+
+        receiver.failuresLeft.set(0);  // the receiver is fixed
+        String deliveryId = jdbc.queryForObject("SELECT id::text FROM webhook_deliveries WHERE endpoint_id = ?::uuid LIMIT 1",
+                String.class, endpointId);
+        mvc.perform(post("/api/v1/webhook-endpoints/{id}/deliveries/{d}/resend", endpointId, deliveryId).with(as(stranger)))
+                .andExpect(status().isNotFound());
+        mvc.perform(post("/api/v1/webhook-endpoints/{id}/deliveries/{d}/resend", endpointId, deliveryId).with(as(owner)))
+                .andExpect(status().isOk());
+        String bulk = mvc.perform(post("/api/v1/webhook-endpoints/{id}/deliveries/resend-failed", endpointId).with(as(owner)))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        assertEquals(1, (int) JsonPath.read(bulk, "$.queued"), "The other failed delivery");
+
+        dispatcher.deliverDue(Instant.now());
+        assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM webhook_deliveries WHERE endpoint_id = ?::uuid AND status = 'DELIVERED'",
+                Integer.class, endpointId));
+        assertEquals(1, jdbc.queryForObject("SELECT attempts FROM webhook_deliveries WHERE id = ?::uuid", Integer.class, deliveryId),
+                "A resend starts a fresh series of attempts");
     }
 
     @Test

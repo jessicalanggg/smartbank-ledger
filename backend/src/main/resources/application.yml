@@ -35,3 +35,9 @@ smartbank:
     anonymous-per-ip: { capacity: 60, refill-every: 1s }
     api-per-user: { capacity: 100, refill-every: 20ms }
     writes-per-user: { capacity: 20, refill-every: 100ms }
+  webhooks:
+    # Encrypts webhook signing secrets at rest. At least 32 characters; keep it out of the database.
+    encryption-key: ${WEBHOOK_ENCRYPTION_KEY}
+    # Production should keep both false: https only, and no internal or private targets (SSRF).
+    allow-http: ${WEBHOOK_ALLOW_HTTP:false}
+    allow-private-targets: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:false}

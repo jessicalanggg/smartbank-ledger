@@ -41,18 +41,23 @@ public class WebhookDispatcher {
 
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
+    private final WebhookUrlGuard guard;
+    private final SecretCipher cipher;
     private final Clock clock;
     private final HttpClient http;
     private final Duration baseBackoff;
     private final int maxAttempts;
     private final Duration requestTimeout;
 
-    public WebhookDispatcher(JdbcTemplate jdbc, ObjectMapper mapper, Clock clock,
+    public WebhookDispatcher(JdbcTemplate jdbc, ObjectMapper mapper, Clock clock, WebhookUrlGuard guard,
+                             SecretCipher cipher,
                              @Value("${smartbank.webhooks.base-backoff:PT10S}") Duration baseBackoff,
                              @Value("${smartbank.webhooks.max-attempts:8}") int maxAttempts,
                              @Value("${smartbank.webhooks.request-timeout:PT10S}") Duration requestTimeout) {
         this.jdbc = jdbc;
         this.mapper = mapper;
+        this.guard = guard;
+        this.cipher = cipher;
         this.clock = clock;
         this.baseBackoff = baseBackoff;
         this.maxAttempts = maxAttempts;
@@ -70,7 +75,8 @@ public class WebhookDispatcher {
         }
     }
 
-    record Claimed(UUID deliveryId, int attempt, String url, String secret,
+    record Claimed(UUID deliveryId, int attempt, UUID endpointId, String url, String secretEncrypted,
+                   String previousSecretEncrypted, Instant previousSecretExpiresAt,
                    UUID eventId, String eventType, String payload, Instant eventCreatedAt) { }
 
     /** Delivers everything due at {@code now}; returns the number of attempts made. */
@@ -99,10 +105,15 @@ public class WebhookDispatcher {
                                ORDER BY next_attempt_at
                                LIMIT ?
                                FOR UPDATE SKIP LOCKED)
-                RETURNING d.id, d.attempts, e.url, e.secret, o.id AS event_id, o.event_type, o.payload,
-                          o.created_at AS event_created_at""",
-                (rs, n) -> new Claimed(rs.getObject("id", UUID.class), rs.getInt("attempts"), rs.getString("url"),
-                        rs.getString("secret"), rs.getObject("event_id", UUID.class), rs.getString("event_type"),
+                RETURNING d.id, d.attempts, e.id AS endpoint_id, e.url, e.secret_encrypted,
+                          e.previous_secret_encrypted, e.previous_secret_expires_at,
+                          o.id AS event_id, o.event_type, o.payload, o.created_at AS event_created_at""",
+                (rs, n) -> new Claimed(rs.getObject("id", UUID.class), rs.getInt("attempts"),
+                        rs.getObject("endpoint_id", UUID.class), rs.getString("url"), rs.getString("secret_encrypted"),
+                        rs.getString("previous_secret_encrypted"),
+                        rs.getTimestamp("previous_secret_expires_at") == null ? null
+                                : rs.getTimestamp("previous_secret_expires_at").toInstant(),
+                        rs.getObject("event_id", UUID.class), rs.getString("event_type"),
                         rs.getString("payload"), rs.getTimestamp("event_created_at").toInstant()),
                 Timestamp.from(now.plus(LEASE)), Timestamp.from(now), Timestamp.from(now), BATCH);
     }
@@ -112,10 +123,13 @@ public class WebhookDispatcher {
         Integer status = null;
         String error = null;
         try {
-            HttpRequest request = HttpRequest.newBuilder(URI.create(d.url()))
+            URI target = URI.create(d.url());
+            // Re-check where the host resolves now: it may have changed since registration.
+            guard.checkResolved(target);
+            HttpRequest request = HttpRequest.newBuilder(target)
                     .timeout(requestTimeout)
                     .header("Content-Type", "application/json")
-                    .header(WebhookSigner.SIGNATURE_HEADER, WebhookSigner.signatureHeader(d.secret(), now.getEpochSecond(), body))
+                    .header(WebhookSigner.SIGNATURE_HEADER, WebhookSigner.signatureHeader(secrets(d, now), now.getEpochSecond(), body))
                     .header(WebhookSigner.EVENT_ID_HEADER, d.eventId().toString())
                     .header(WebhookSigner.DELIVERY_ID_HEADER, d.deliveryId().toString())
                     .header(WebhookSigner.ATTEMPT_HEADER, String.valueOf(d.attempt()))
@@ -131,6 +145,8 @@ public class WebhookDispatcher {
                 return;
             }
             error = "HTTP " + status;
+        } catch (WebhookUrlGuard.BlockedUrlException e) {
+            error = "Blocked: " + e.getMessage();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             error = "Interrupted";
@@ -144,6 +160,15 @@ public class WebhookDispatcher {
                 exhausted ? "FAILED" : "PENDING", Timestamp.from(exhausted ? now : now.plus(backoff(d.attempt()))),
                 status, error.length() > 500 ? error.substring(0, 500) : error, d.deliveryId());
         if (exhausted) log.warn("Webhook delivery {} failed permanently after {} attempts: {}", d.deliveryId(), d.attempt(), error);
+    }
+
+    /** The current secret, plus the previous one while a rotation's overlap lasts. */
+    private List<String> secrets(Claimed d, Instant now) {
+        String endpoint = d.endpointId().toString();
+        String current = cipher.decrypt(d.secretEncrypted(), endpoint);
+        if (d.previousSecretEncrypted() != null && d.previousSecretExpiresAt().isAfter(now))
+            return List.of(current, cipher.decrypt(d.previousSecretEncrypted(), endpoint));
+        return List.of(current);
     }
 
     /** baseBackoff * 2^(attempt-1), plus up to 20% jitter so retries from many deliveries spread out. */
