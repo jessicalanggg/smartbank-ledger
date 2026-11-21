@@ -1,8 +1,13 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.*;
+import com.smartbank.common.UuidOrder;
 import com.smartbank.ledger.LedgerAccount;
 import com.smartbank.ledger.LedgerEntry;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.dao.ConcurrencyFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -78,10 +83,30 @@ public class BankingService {
                 request.amount(), request.requestKey()));
     }
 
+    /** Posts a transfer, through the batcher when it is enabled. */
     public TransactionResponse transfer(TransferRequest request) {
         if (request.fromAccountId().equals(request.toAccountId()))
             throw new BankingException("Source and destination must differ");
+        if (request.requestKey() == null || request.requestKey().isBlank())
+            throw new IllegalArgumentException("A request key is required");
+        return batcher != null ? batcher.submit(request) : transferDirect(request);
+    }
+
+    /** Posts a single transfer in its own transaction, without batching. */
+    TransactionResponse transferDirect(TransferRequest request) {
         return idempotent(request.requestKey(), prior -> replay(prior, request), () -> postTransfer(request));
+    }
+
+    TransactionResponse replayTransfer(BankingTransaction prior, TransferRequest request) {
+        return replay(prior, request);
+    }
+
+    private TransferBatcher batcher;
+
+    @Autowired(required = false)
+    void setBatcher(@Lazy TransferBatcher batcher,
+                    @Value("${smartbank.batching.enabled:true}") boolean enabled) {
+        this.batcher = enabled ? batcher : null;
     }
 
     /**
@@ -103,13 +128,20 @@ public class BankingService {
         var previous = transactions.findByRequestKey(key);
         if (previous.isPresent())
             return replayLinked(previous.get(), legs);
-        try {
-            return transactionTemplate.execute(status -> postLinked(legs, key));
-        } catch (DataIntegrityViolationException e) {
-            var winner = transactions.findByRequestKey(key);
-            if (winner.isPresent())
-                return replayLinked(winner.get(), legs);
-            throw e;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return transactionTemplate.execute(status -> postLinked(legs, key));
+            } catch (DataIntegrityViolationException e) {
+                var winner = transactions.findByRequestKey(key);
+                if (winner.isPresent())
+                    return replayLinked(winner.get(), legs);
+                throw e;
+            } catch (ConcurrencyFailureException e) {
+                if (attempt >= MAX_DEADLOCK_RETRIES) throw e;
+                var winner = transactions.findByRequestKey(key);
+                if (winner.isPresent())
+                    return replayLinked(winner.get(), legs);
+            }
         }
     }
 
@@ -119,7 +151,7 @@ public class BankingService {
         Map<UUID, Account> found = new HashMap<>();
         accounts.findAllById(ids).forEach(a -> found.put(a.getId(), a));
         // Net change per account, kept in UUID order for the balance batch.
-        Map<UUID, BigDecimal> net = new TreeMap<>();
+        Map<UUID, BigDecimal> net = new TreeMap<>(UuidOrder.COMPARATOR);
         UUID linkId = UUID.randomUUID();
         List<BankingTransaction> rows = new ArrayList<>();
         for (int i = 0; i < legs.size(); i++) {
@@ -173,19 +205,27 @@ public class BankingService {
             Supplier<TransactionResponse> post) {
         if (requestKey == null || requestKey.isBlank())
             throw new IllegalArgumentException("A request key is required");
-        var previous = transactions.findByRequestKey(requestKey);
-        if (previous.isPresent())
-            return replay.apply(previous.get());
-        try {
-            return transactionTemplate.execute(status -> post.get());
-        } catch (DataIntegrityViolationException e) {
-            // A simultaneous request with the same key committed first.
-            var winner = transactions.findByRequestKey(requestKey);
-            if (winner.isPresent())
-                return replay.apply(winner.get());
-            throw e;
+        for (int attempt = 1; ; attempt++) {
+            var previous = transactions.findByRequestKey(requestKey);
+            if (previous.isPresent())
+                return replay.apply(previous.get());
+            try {
+                return transactionTemplate.execute(status -> post.get());
+            } catch (DataIntegrityViolationException e) {
+                // A simultaneous request with the same key committed first.
+                var winner = transactions.findByRequestKey(requestKey);
+                if (winner.isPresent())
+                    return replay.apply(winner.get());
+                throw e;
+            } catch (ConcurrencyFailureException e) {
+                // Chosen as a deadlock victim (possible when the same key is in flight in a batch).
+                // Nothing was written, and the request key makes a retry safe.
+                if (attempt >= MAX_DEADLOCK_RETRIES) throw e;
+            }
         }
     }
+
+    private static final int MAX_DEADLOCK_RETRIES = 3;
 
     private TransactionResponse postSingleAccount(TransactionType type, UUID accountId, MoneyRequest request) {
         Account account = accounts.findById(accountId).orElseThrow(() -> new AccountNotFoundException(accountId));
@@ -219,7 +259,7 @@ public class BankingService {
         // Critical section: row locks from here until commit, taken in UUID order, in one round trip.
         var debit = new PostingWriter.BalanceChange(from, amount.negate());
         var credit = new PostingWriter.BalanceChange(to, amount);
-        boolean debitFirst = from.compareTo(to) < 0;
+        boolean debitFirst = UuidOrder.before(from, to);
         boolean[] applied = writer.applyBalanceChanges(debitFirst ? List.of(debit, credit) : List.of(credit, debit));
         if (!applied[debitFirst ? 0 : 1])
             throw new BankingException("Insufficient funds");
@@ -236,7 +276,7 @@ public class BankingService {
     record LockedPair(Account source, Account target) { }
 
     LockedPair lockPair(UUID sourceId, UUID targetId) {
-        boolean sourceFirst = sourceId.compareTo(targetId) < 0;
+        boolean sourceFirst = UuidOrder.before(sourceId, targetId);
         Account first = locked(sourceFirst ? sourceId : targetId);
         Account second = locked(sourceFirst ? targetId : sourceId);
         return sourceFirst ? new LockedPair(first, second) : new LockedPair(second, first);

@@ -25,4 +25,12 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
      */
     @Query(value = "SELECT * FROM accounts WHERE id = :id FOR NO KEY UPDATE", nativeQuery = true)
     Optional<Account> findLockedById(@Param("id") UUID id);
+
+    /**
+     * Locks several accounts in one statement. PostgreSQL applies FOR NO KEY UPDATE
+     * after sorting, so rows are locked in id order, which is UuidOrder, the lock
+     * order every other path uses.
+     */
+    @Query(value = "SELECT * FROM accounts WHERE id IN (:ids) ORDER BY id FOR NO KEY UPDATE", nativeQuery = true)
+    java.util.List<Account> lockAllInOrder(@Param("ids") java.util.Collection<UUID> ids);
 }
