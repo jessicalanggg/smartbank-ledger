@@ -9,7 +9,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Accounts, deposits, withdrawals and transfers** through a versioned REST API (`/api/v1`), with transaction history per account.
 - **Double-entry ledger.** Every transaction posts balanced, append-only ledger entries: a transfer debits one customer account and credits another; a deposit or withdrawal posts against an `EXTERNAL_CLEARING` account. PostgreSQL rejects at commit any transaction whose entries do not sum to zero, and rejects any `UPDATE` or `DELETE` of entries or transactions. A reconciliation check proves every cached account balance equals the sum of its entries.
 - **Two-phase transfers (holds).** A payer places a hold that reserves money without moving it, the way a card authorization does. The payee then posts it (in full or in part, releasing the rest) or voids it, and unposted holds expire automatically. Each account reports a posted balance, an available balance and pending amounts, and PostgreSQL rejects any change that would make the available balance negative.
-- **Transactional outbox and signed webhooks.** Every posting and hold change writes an event in the same database transaction, so an event exists if and only if its change committed. A worker delivers events to subscribed endpoints with HMAC-SHA256 signatures, at least once, with exponential backoff, a dead-letter state, and `SKIP LOCKED` leases so several instances can deliver safely. See [docs/webhooks.md](docs/webhooks.md).
+- **Transactional outbox and signed webhooks.** Every posting and hold change writes an event in the same database transaction, so an event exists if and only if its change committed. A worker delivers events to subscribed endpoints with HMAC-SHA256 signatures, at least once, with exponential backoff, a dead-letter state, and `SKIP LOCKED` leases so several instances can deliver safely. Webhook URLs are checked against SSRF (no internal or private addresses) at registration and before every delivery; signing secrets are encrypted at rest and can be rotated with an overlap; dead-lettered deliveries can be resent. See [docs/webhooks.md](docs/webhooks.md).
 - **Linked transfers.** Up to 20 transfers that post together or not at all, such as "charge the customer, pay the merchant, take a fee". Funds are checked on each account's net change across the group, every leg gets its own ledger entries and event tagged with the group's `linkId`, and the whole group is written in one SQL statement.
 - **Reversals.** Mistakes are corrected with a new `REVERSAL` posting that points at the original and moves money back along the same path, never by editing history. Partial reversals are allowed but never exceed the original in total, enforced by a database trigger that locks the original at commit. A payee can refund a transfer; only an administrator can reverse deposits and withdrawals.
 - **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
@@ -41,6 +41,7 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | Rate-limit tests | Failed logins lock an account while successes do not count; unknown emails behave like real ones; one address cannot spray many accounts; registrations per address; per-user API limits refill; writes have a stricter limit; 200 concurrent requests take exactly the 25 tokens that exist; two app instances share one budget; idle buckets are pruned |
 | Idempotency API tests | Byte-identical replays, per-user scoping, 422 on a different request, stored business errors, keys not consumed by 403/400, expiry and pruning, recovery when the response was never stored, 30 simultaneous retries posting once |
 | Linked transfer tests | Charge/pay/fee flow; one failing leg posts nothing; net funds checks; idempotent retries and 422 on key reuse; caller must own every source; validation. Plus 1,500 concurrent groups of 2–5 legs: every committed group has all its legs, rejected groups none, no deadlocks |
+| Webhook hardening tests | 33 SSRF URL cases; internal URLs refused at registration; a host that now resolves internally gets no request; secrets stored only encrypted and bound to their endpoint; old plain-text secrets migrated; rotation signs with both secrets during the overlap; dead-lettered deliveries resent |
 | Webhook tests (real HTTP receiver) | Events only for committed changes; routing to payer and payee only; signatures verify and reject tampering; retries on schedule; dead-lettering; timeouts; expired leases; 6 concurrent workers deliver 120 events exactly once |
 | Hold API tests (real JWT security) | Only the payer can place a hold, only the payee can post or void it, only the two parties can see it |
 | Ledger tests | Each operation posts the right balanced entries; unbalanced postings, transactions without entries, and edits or deletes of history are rejected by PostgreSQL; reconciliation detects a balance changed outside the ledger |
@@ -181,6 +182,8 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `GET` | `/api/v1/webhook-endpoints` | The caller's endpoints |
 | `DELETE` | `/api/v1/webhook-endpoints/{id}` | Deactivate |
 | `GET` | `/api/v1/webhook-endpoints/{id}/deliveries` | Delivery status, attempts and errors |
+| `POST` | `/api/v1/webhook-endpoints/{id}/rotate-secret` | New secret, old one still signs during `?overlapSeconds=` |
+| `POST` | `/api/v1/webhook-endpoints/{id}/deliveries/{deliveryId}/resend` | Resend one delivery (`…/deliveries/resend-failed` for all failed) |
 
 Account responses include `balance` (posted), `availableBalance`, `pendingDebits` and `pendingCredits`.
 
@@ -209,18 +212,18 @@ Sending the same command again with the same `$KEY` returns the identical respon
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/ratelimit`: token-bucket limiter, limits, filter
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
 
 ## Limitations and roadmap
 
-Not implemented: refresh tokens or token revocation, MFA, account opening, audit logging, pagination beyond the newest 100 transactions, and cross-currency transfers. The demo password and JWT secret in `infra/compose.yml` are for local use only.
+Not implemented: refresh tokens or token revocation, MFA, account opening, audit logging, pagination beyond the newest 100 transactions, and cross-currency transfers. The demo password, JWT secret and webhook encryption key in `infra/compose.yml` are for local use only, and Compose allows http and private webhook targets so a receiver on your machine works; production must set `WEBHOOK_ENCRYPTION_KEY` and leave `WEBHOOK_ALLOW_HTTP` and `WEBHOOK_ALLOW_PRIVATE_TARGETS` off.
 
 Next steps:
 - Re-run the throughput benchmark on a quiet machine after the round-trip and outbox changes, and apply the short-lock design to holds.
-- Webhook hardening: SSRF protection, encrypted secrets with rotation, a replay API for dead-lettered deliveries.
+- Close the remaining DNS-rebinding window for webhooks with an egress proxy, and allow rotating the secret-encryption key.
 - Holds in the frontend (the API and tests are complete; the UI does not show holds yet).
 
 Development history by sprint: [Sprint 2](SPRINT2_README.md) (transactions), [Sprint 3](SPRINT3_README.md) (authentication), [frontend](frontend/README.md).

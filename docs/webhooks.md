@@ -71,6 +71,9 @@ Every attempt for an event sends the same body; only the signature timestamp and
 | `GET` | `/api/v1/webhook-endpoints` | The caller's endpoints, without secrets |
 | `DELETE` | `/api/v1/webhook-endpoints/{id}` | Deactivates it; queued deliveries are marked failed |
 | `GET` | `/api/v1/webhook-endpoints/{id}/deliveries` | Newest 100 deliveries with status, attempts, last status code and error |
+| `POST` | `/api/v1/webhook-endpoints/{id}/rotate-secret` | `?overlapSeconds=` (default 86400). Returns the new secret once |
+| `POST` | `/api/v1/webhook-endpoints/{id}/deliveries/{deliveryId}/resend` | Queue one delivery again |
+| `POST` | `/api/v1/webhook-endpoints/{id}/deliveries/resend-failed` | Queue every dead-lettered delivery again |
 
 ## Tests
 
@@ -88,10 +91,22 @@ Every attempt for an event sends the same body; only the signature timestamp and
 
 Checked against a planted bug: with withdrawals skipping their event, the model-based test failed and shrank the failure to a single withdrawal.
 
+## Hardening
+
+**SSRF protection** ([`WebhookUrlGuard`](../backend/src/main/java/com/smartbank/events/WebhookUrlGuard.java)). Without it, a user could register `http://169.254.169.254/…` (cloud metadata) or `http://localhost:5432` and make SmartBank send requests into its own network. A webhook URL must be `https`, carry no credentials, and every address its host resolves to must be public: not loopback, private, link-local, carrier-grade NAT, unique-local, multicast or unspecified, including IPv4 addresses embedded in IPv6 (mapped, compatible, 6to4, NAT64). The check runs at registration and **again before every delivery**, so a hostname that later starts resolving to an internal address (DNS rebinding) is caught; such deliveries fail with `Blocked: …` and no request is sent. Redirects are never followed. For local development, `WEBHOOK_ALLOW_HTTP` and `WEBHOOK_ALLOW_PRIVATE_TARGETS` relax this; both default to `false`.
+
+**Encrypted secrets** ([`SecretCipher`](../backend/src/main/java/com/smartbank/events/SecretCipher.java)). Signing secrets are stored with AES-256-GCM under a key from `WEBHOOK_ENCRYPTION_KEY` (at least 32 characters, kept out of the database). Each ciphertext is bound to its endpoint's id, so copying it onto another endpoint's row makes it fail to decrypt. Secrets stored in plain text before this change are encrypted at startup.
+
+**Secret rotation.** `POST /api/v1/webhook-endpoints/{id}/rotate-secret?overlapSeconds=86400` returns a new secret, once. Until the overlap ends, deliveries carry two signatures, `t=…,v1=<new>,v1=<old>`, so receivers that still know only the old secret keep accepting them; afterwards only the new secret signs. `overlapSeconds=0` stops the old secret at once, for a leaked secret.
+
+**Resending.** After fixing a receiver, the owner can queue a dead-lettered delivery again (`POST …/deliveries/{deliveryId}/resend`) or all of them (`POST …/deliveries/resend-failed`). A resend starts a fresh series of attempts.
+
+**Tests.** [`WebhookUrlGuardTest`](../backend/src/test/java/com/smartbank/events/WebhookUrlGuardTest.java) covers 33 URL cases with a fake DNS resolver. [`WebhookSsrfTest`](../backend/src/test/java/com/smartbank/events/WebhookSsrfTest.java) runs with the production defaults: internal URLs cannot be registered, and an endpoint whose host now resolves to 127.0.0.1 gets no request at all. With the delivery-time check removed, that test fails, because a request reaches the internal server. The webhook integration tests check that secrets are stored only encrypted and bound to their endpoint, that old plain-text secrets are migrated, that rotation signs with both secrets during the overlap and only the new one after, and that dead-lettered deliveries can be resent.
+
 ## Limits
 
-- **SSRF.** Endpoint URLs are checked for an absolute `http`/`https` form only. A production system must block private, loopback and link-local addresses, including after DNS resolution, or send webhooks through an egress proxy.
-- **Secrets** are stored in plain text, because signing needs them. Production would encrypt them at rest and support rotation, with two valid secrets during a changeover.
+- **DNS rebinding window.** The address check and the HTTP client's own DNS lookup are separate, so a host that changes its answer within that moment could slip through. Closing it fully needs an egress proxy or pinning the connection to the checked IP.
+- **The encryption key** itself cannot be rotated yet (ciphertexts carry a `v1:` version prefix to allow it later), and lives in an environment variable rather than a key management service.
 - **Ordering** is not guaranteed: a retry can arrive after a later event. Receivers should order by the event's `createdAt` or re-read state.
-- **No replay API** for resending dead-lettered deliveries yet, and no pruning of old events or deliveries.
+- **No pruning** of old events or deliveries.
 - **Throughput impact** is not yet measured reliably. The outbox adds two SQL statements per posting, both outside the account-lock window; an A/B run was too noisy to quantify it (see [benchmarks](benchmarks.md)).
