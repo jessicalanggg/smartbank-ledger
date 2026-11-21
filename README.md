@@ -32,10 +32,15 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | Hold tests | Reservation, full and partial posting, voids, expiry (including a post that arrives after expiry), idempotency, and database rules on hold state changes |
 | Hold API tests (real JWT security) | Only the payer can place a hold, only the payee can post or void it, only the two parties can see it |
 | Ledger tests | Each operation posts the right balanced entries; unbalanced postings, transactions without entries, and edits or deletes of history are rejected by PostgreSQL; reconciliation detects a balance changed outside the ledger |
+| Model-based randomized test | 4,800 random operations per run (transfers, retries, key conflicts, holds, posts, voids, expiry) match an independent model after every step; failures shrink to a minimal reproduction with a seed |
+| Network fault injection (Toxiproxy) | Connections cut 8 times under load; clients retry with the same key; every acknowledged transfer exists exactly once, lost acknowledgements are replayed, books reconcile |
+| Database crash injection | PostgreSQL killed with `SIGKILL` twice under load and recovered from its WAL; every acknowledged transfer survives, nothing posts twice, books reconcile |
 | Migration test | Upgrading a database with pre-ledger history backfills entries and opening balances that reconcile exactly |
 | Integration tests | Rollback on insufficient funds and on database constraint failures, key-reuse conflicts, cross-currency rejection. After every test the ledger must still reconcile |
 | Unit tests (JUnit 5, Mockito, MockMvc) | Service rules, write order (ledger rows before balance updates), stale-read rejection, replay of simultaneous duplicates, ownership checks |
 | Hot-account benchmark (opt-in) | Throughput and p50/p95/p99 latency as 0–100% of transfers pay one account; ledger reconciled after every run |
+
+Fault testing method, results and limits: [docs/fault-testing.md](docs/fault-testing.md).
 
 See [`ConcurrencyIntegrationTest`](backend/src/test/java/com/smartbank/transaction/ConcurrencyIntegrationTest.java), [`LedgerIntegrationTest`](backend/src/test/java/com/smartbank/ledger/LedgerIntegrationTest.java) and [`LedgerMigrationTest`](backend/src/test/java/com/smartbank/ledger/LedgerMigrationTest.java).
 
@@ -70,7 +75,7 @@ PENDING ──post (full or partial)──▶ POSTED    money moves through the 
 
 ## Tech stack
 
-Java 21, Spring Boot 3.5, Spring Data JPA, Spring Security (OAuth2 resource server, JWT), PostgreSQL 17, Flyway, Testcontainers, JUnit 5, Mockito, React 19, TypeScript, Vite, Docker Compose, GitHub Actions.
+Java 21, Spring Boot 3.5, Spring Data JPA, Spring Security (OAuth2 resource server, JWT), PostgreSQL 17, Flyway, Testcontainers, Toxiproxy, JUnit 5, Mockito, React 19, TypeScript, Vite, Docker Compose, GitHub Actions.
 
 ## Run it locally
 
@@ -153,7 +158,7 @@ Sending the same command again with the same `requestKey` returns the same trans
 - `backend/src/main/java/com/smartbank/ledger`: ledger entries, posting accounts, reconciliation
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
 - `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds)
-- `backend/src/test`: unit, integration and concurrency tests
+- `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
 
@@ -163,7 +168,6 @@ Not implemented: refresh tokens or token revocation, rate limiting, MFA, account
 
 Next steps:
 - Fewer round trips per transfer to raise the overall throughput ceiling, and the short-lock design for holds.
-- Fault testing: property-based operation sequences (jqwik) and crash or network-failure injection mid-transfer (Toxiproxy).
 - Idempotency keys scoped per user with expiry, replaying the original response.
 - Transactional outbox with signed webhooks for posted, voided and expired events.
 - Holds in the frontend (the API and tests are complete; the UI does not show holds yet).
