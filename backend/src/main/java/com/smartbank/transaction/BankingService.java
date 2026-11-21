@@ -200,6 +200,63 @@ public class BankingService {
         return new LinkedTransferResponse(prior.getLinkId(), stored.stream().map(TransactionResponse::from).toList());
     }
 
+    /**
+     * Reverses a transfer, deposit or withdrawal, in full (amount null: whatever is
+     * left) or in part. The original is locked first, so reversals of one
+     * transaction are decided one at a time against what is left; a database
+     * trigger re-checks the total at commit.
+     */
+    public TransactionResponse reverse(UUID originalId, ReversalRequest request) {
+        return idempotent(request.requestKey(),
+                prior -> replayReversal(prior, originalId, request.amount()),
+                () -> postReversal(originalId, request.amount(), request.requestKey()));
+    }
+
+    /** The transaction, for authorization checks before reversing it. */
+    public TransactionResponse getTransaction(UUID id) {
+        return transactions.findById(id).map(TransactionResponse::from)
+                .orElseThrow(() -> new TransactionNotFoundException(id));
+    }
+
+    private TransactionResponse postReversal(UUID originalId, BigDecimal requested, String key) {
+        BankingTransaction original = transactions.findLockedById(originalId)
+                .orElseThrow(() -> new TransactionNotFoundException(originalId));
+        // A simultaneous identical request may have committed while we waited for the lock.
+        var previous = transactions.findByRequestKey(key);
+        if (previous.isPresent()) return replayReversal(previous.get(), originalId, requested);
+        if (!Set.of(TransactionType.TRANSFER, TransactionType.DEPOSIT, TransactionType.WITHDRAWAL)
+                .contains(original.getTransactionType()))
+            throw new BankingException("Only transfers, deposits and withdrawals can be reversed");
+        BigDecimal remaining = original.getAmount().subtract(transactions.sumReversedAmount(originalId));
+        if (remaining.signum() <= 0)
+            throw new BankingException("Transaction is already fully reversed");
+        BigDecimal amount = requested == null ? remaining : requested;
+        if (amount.compareTo(remaining) > 0)
+            throw new BankingException("Cannot reverse more than the remaining " + remaining.toPlainString());
+
+        BankingTransaction reversal = BankingTransaction.reversalOf(original, amount, key);
+        UUID from = reversal.getSourceAccountId(), to = reversal.getDestinationAccountId();
+        if (from != null)
+            failFastIfUnavailable(accounts.findById(from).orElseThrow(() -> new AccountNotFoundException(from)), amount);
+        TransactionResponse response = writer.post(reversal);
+        List<PostingWriter.BalanceChange> changes = new ArrayList<>();
+        if (from != null) changes.add(new PostingWriter.BalanceChange(from, amount.negate()));
+        if (to != null) changes.add(new PostingWriter.BalanceChange(to, amount));
+        changes.sort((a, b) -> UuidOrder.COMPARATOR.compare(a.accountId(), b.accountId()));
+        boolean[] applied = writer.applyBalanceChanges(changes);
+        for (int i = 0; i < changes.size(); i++)
+            if (!applied[i]) throw new BankingException("Insufficient funds");
+        return response;
+    }
+
+    private TransactionResponse replayReversal(BankingTransaction prior, UUID originalId, BigDecimal requested) {
+        if (prior.getTransactionType() != TransactionType.REVERSAL
+                || !originalId.equals(prior.getReversesTransactionId())
+                || (requested != null && requested.compareTo(prior.getAmount()) != 0))
+            throw new BankingException("Request key was already used for a different operation");
+        return TransactionResponse.from(prior);
+    }
+
     private TransactionResponse idempotent(String requestKey,
             Function<BankingTransaction, TransactionResponse> replay,
             Supplier<TransactionResponse> post) {
@@ -345,6 +402,14 @@ public class BankingService {
             case OPENING_BALANCE -> List.of(
                     LedgerEntry.internal(id, LedgerAccount.OPENING_EQUITY, amount.negate(), currency, at),
                     LedgerEntry.customer(id, tx.getDestinationAccountId(), amount, currency, at));
+            // A reversal follows the original's path backwards; a null side is external clearing.
+            case REVERSAL -> List.of(
+                    tx.getSourceAccountId() == null
+                            ? LedgerEntry.internal(id, LedgerAccount.EXTERNAL_CLEARING, amount.negate(), currency, at)
+                            : LedgerEntry.customer(id, tx.getSourceAccountId(), amount.negate(), currency, at),
+                    tx.getDestinationAccountId() == null
+                            ? LedgerEntry.internal(id, LedgerAccount.EXTERNAL_CLEARING, amount, currency, at)
+                            : LedgerEntry.customer(id, tx.getDestinationAccountId(), amount, currency, at));
         };
     }
 }

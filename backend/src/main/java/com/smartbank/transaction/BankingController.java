@@ -80,6 +80,25 @@ public class BankingController {
                 HttpStatus.CREATED, op -> service.linkedTransfer(new LinkedTransferRequest(request.transfers(), op)));
     }
 
+    /**
+     * Reverses a transaction in full or in part. A transfer can be refunded by its
+     * payee (the money comes back out of their account) or by an administrator.
+     * Deposits and withdrawals move money in or out of the bank, so only an
+     * administrator can reverse them.
+     */
+    @PostMapping("/transactions/{id}/reversals")
+    public ResponseEntity<String> reverse(@PathVariable UUID id,
+                                          @Valid @RequestBody(required = false) ReversalRequest body,
+                                          @RequestHeader(value = HEADER, required = false) String key) {
+        ReversalRequest request = body == null ? new ReversalRequest(null, null) : body;
+        TransactionResponse original = service.getTransaction(id);
+        if (original.type() == TransactionType.TRANSFER && !access.isAdmin()) access.requireOwner(original.toAccountId());
+        else if (original.type() != TransactionType.TRANSFER) access.requireAdmin();
+        return idempotency.execute(key, request.requestKey(),
+                fingerprint("reversal", id, request.amount() == null ? "remaining" : request.amount()),
+                HttpStatus.CREATED, op -> service.reverse(id, new ReversalRequest(request.amount(), op)));
+    }
+
     @GetMapping("/accounts/{id}/transactions")
     public List<TransactionResponse> history(@PathVariable UUID id) {
         access.requireOwner(id);

@@ -21,6 +21,8 @@ public class BankingTransaction {
     /** Set for legs of a linked transfer: the group id and this leg's position. */
     @Column(name = "link_id", updatable = false) private UUID linkId;
     @Column(name = "link_index", updatable = false) private Short linkIndex;
+    /** Set for reversals: the transaction this one (partly) undoes. */
+    @Column(name = "reverses_transaction_id", updatable = false) private UUID reversesTransactionId;
 
     protected BankingTransaction() { }
     public BankingTransaction(TransactionType type, UUID source, UUID destination,
@@ -49,6 +51,19 @@ public class BankingTransaction {
     public String getCurrency() { return currency; }
     public String getRequestKey() { return requestKey; }
     public Instant getCreatedAt() { return createdAt; }
+    /**
+     * A reversal of {@code original}: the same path in the opposite direction. The
+     * original's payee pays back its payer; for a deposit or withdrawal the external
+     * side is null, as on the original.
+     */
+    static BankingTransaction reversalOf(BankingTransaction original, BigDecimal amount, String requestKey) {
+        BankingTransaction reversal = new BankingTransaction(TransactionType.REVERSAL,
+                original.getDestinationAccountId(), original.getSourceAccountId(), amount, original.getCurrency(), requestKey);
+        reversal.reversesTransactionId = original.getId();
+        return reversal;
+    }
+
+    public UUID getReversesTransactionId() { return reversesTransactionId; }
     public UUID getLinkId() { return linkId; }
     public Integer getLinkIndex() { return linkIndex == null ? null : linkIndex.intValue(); }
 }

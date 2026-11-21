@@ -14,7 +14,7 @@ import static org.mockito.Mockito.*;
 
 class AccessServiceTest {
     private final AccountRepository accounts = mock(AccountRepository.class);
-    private final AccessService service = new AccessService(accounts);
+    private final AccessService service = new AccessService(accounts, mock(UserRepository.class));
     @AfterEach void clear() { SecurityContextHolder.clearContext(); }
     private void authenticate(UUID userId) {
         Jwt jwt = new Jwt("test", Instant.now(), Instant.now().plusSeconds(60),

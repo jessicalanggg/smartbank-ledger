@@ -10,7 +10,8 @@ import java.util.UUID;
 @Service
 public class AccessService {
     private final AccountRepository accounts;
-    public AccessService(AccountRepository accounts) { this.accounts = accounts; }
+    private final UserRepository users;
+    public AccessService(AccountRepository accounts, UserRepository users) { this.accounts = accounts; this.users = users; }
     public UUID currentUserId() {
         Object principal = SecurityContextHolder.getContext().getAuthentication().getPrincipal();
         if (!(principal instanceof Jwt jwt)) throw new AccessDeniedException("Authentication required");
@@ -19,6 +20,12 @@ public class AccessService {
     public void requireOwner(UUID accountId) {
         if (!accounts.existsByIdAndOwnerUserId(accountId, currentUserId()))
             throw new AccessDeniedException("Account access denied");
+    }
+    public boolean isAdmin() {
+        return users.findById(currentUserId()).map(u -> "ADMIN".equals(u.getRole())).orElse(false);
+    }
+    public void requireAdmin() {
+        if (!isAdmin()) throw new AccessDeniedException("Administrator access required");
     }
     public void requireOwnerOfAny(UUID... accountIds) {
         UUID user = currentUserId();

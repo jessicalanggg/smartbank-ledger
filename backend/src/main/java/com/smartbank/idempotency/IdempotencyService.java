@@ -6,6 +6,7 @@ import com.smartbank.account.AccountNotFoundException;
 import com.smartbank.auth.AccessService;
 import com.smartbank.common.ApiExceptionHandler;
 import com.smartbank.transaction.BankingException;
+import com.smartbank.transaction.TransactionNotFoundException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -102,6 +103,9 @@ public class IdempotencyService {
             status = HttpStatus.CONFLICT.value();
         } catch (AccountNotFoundException e) {
             body = errors.notFound(e);
+            status = HttpStatus.NOT_FOUND.value();
+        } catch (TransactionNotFoundException e) {
+            body = errors.transactionNotFound(e);
             status = HttpStatus.NOT_FOUND.value();
         }
         return complete(user, key, claim.operationKey(), status, write(body));

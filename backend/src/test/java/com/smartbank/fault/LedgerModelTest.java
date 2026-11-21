@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Model-based randomized testing. Random sequences of operations (deposits,
- * withdrawals, transfers, linked transfers, exact retries, conflicting key reuse,
+ * withdrawals, transfers, linked transfers, reversals, exact retries, conflicting key reuse,
  * holds and their post/void/expiry) run against PostgreSQL. A small in-memory model, written
  * independently of the service code, predicts each outcome and every balance.
  * After each operation the outcome and all balances must match the model; at the
@@ -54,13 +54,15 @@ class LedgerModelTest {
 
     enum Outcome { OK, REJECTED, NOT_FOUND }
 
-    sealed interface Op permits Deposit, Withdraw, Transfer, Linked, CreateHold, PostHold, VoidHold, ExpireHold { }
+    sealed interface Op permits Deposit, Withdraw, Transfer, Linked, Reverse, CreateHold, PostHold, VoidHold, ExpireHold { }
     record Deposit(int account, BigDecimal amount, String key) implements Op { }
     record Withdraw(int account, BigDecimal amount, String key) implements Op { }
     record Transfer(int from, int to, BigDecimal amount, String key) implements Op { }
     record Leg(int from, int to, BigDecimal amount) { }
     /** A linked transfer: every leg posts or none does. */
     record Linked(List<Leg> legs, String key) implements Op { }
+    /** Reverses the deposit, withdrawal or transfer made with originalKey; amount null reverses what is left. */
+    record Reverse(String originalKey, BigDecimal amount, String key) implements Op { }
     record CreateHold(int from, int to, BigDecimal amount, String key) implements Op { }
     /** amount null posts the full hold. Holds are referred to by their creation key. */
     record PostHold(String holdKey, BigDecimal amount) implements Op { }
@@ -75,6 +77,8 @@ class LedgerModelTest {
         final BigDecimal[] pendingCredits = new BigDecimal[ACCOUNTS];
         /** Request key to the money operation that first used it successfully. */
         final Map<String, Op> moneyKeys = new HashMap<>();
+        /** Amount reversed so far, by the original's request key. */
+        final Map<String, BigDecimal> reversed = new HashMap<>();
         final Map<String, ModelHold> holdsByKey = new HashMap<>();
 
         static final class ModelHold {
@@ -136,6 +140,46 @@ class LedgerModelTest {
                     moneyKeys.put(l.key(), l);
                     return Outcome.OK;
                 }
+                case Reverse v -> {
+                    Op prior = moneyKeys.get(v.key());
+                    if (prior != null)
+                        return prior instanceof Reverse p && p.originalKey().equals(v.originalKey())
+                                && (v.amount() == null || reversalAmount(p).compareTo(v.amount()) == 0)
+                                ? Outcome.OK : Outcome.REJECTED;
+                    Op original = moneyKeys.get(v.originalKey());
+                    // Reversals target single transactions; the test does not address a linked group by id.
+                    if (original == null || original instanceof Linked) return Outcome.NOT_FOUND;
+                    if (!(original instanceof Deposit || original instanceof Withdraw || original instanceof Transfer))
+                        return Outcome.REJECTED;
+                    BigDecimal originalAmount = switch (original) {
+                        case Deposit d -> d.amount();
+                        case Withdraw w -> w.amount();
+                        case Transfer t -> t.amount();
+                        default -> throw new IllegalStateException();
+                    };
+                    BigDecimal remaining = originalAmount.subtract(reversed.getOrDefault(v.originalKey(), BigDecimal.ZERO));
+                    if (remaining.signum() <= 0) return Outcome.REJECTED;
+                    BigDecimal amount = v.amount() == null ? remaining : v.amount();
+                    if (amount.compareTo(remaining) > 0) return Outcome.REJECTED;
+                    // The money goes back the way it came.
+                    Integer from = switch (original) {
+                        case Deposit d -> d.account();
+                        case Transfer t -> t.to();
+                        default -> null;
+                    };
+                    Integer to = switch (original) {
+                        case Withdraw w -> w.account();
+                        case Transfer t -> t.from();
+                        default -> null;
+                    };
+                    if (from != null && available(from).compareTo(amount) < 0) return Outcome.REJECTED;
+                    if (from != null) balance[from] = balance[from].subtract(amount);
+                    if (to != null) balance[to] = balance[to].add(amount);
+                    reversed.merge(v.originalKey(), amount, BigDecimal::add);
+                    resolvedReversals.put(v.key(), amount);
+                    moneyKeys.put(v.key(), v);
+                    return Outcome.OK;
+                }
                 case CreateHold c -> {
                     if (c.from() == c.to()) return Outcome.REJECTED;
                     ModelHold prior = holdsByKey.get(c.key());
@@ -177,6 +221,13 @@ class LedgerModelTest {
                     return Outcome.OK;
                 }
             }
+        }
+
+        /** What each successful reversal actually reversed (its amount may have been "whatever is left"). */
+        final Map<String, BigDecimal> resolvedReversals = new HashMap<>();
+
+        private BigDecimal reversalAmount(Reverse r) {
+            return resolvedReversals.get(r.key());
         }
 
         private void release(ModelHold h) {
@@ -223,6 +274,11 @@ class LedgerModelTest {
             } else if (kind < 15 && !moneyOps.isEmpty()) {
                 String reused = keyOf(moneyOps.get(r.nextInt(moneyOps.size())));  // conflicting reuse
                 op = new Transfer(a, b, amount, reused);
+            } else if (kind < 20 && !moneyOps.isEmpty()) {
+                // Reverse an earlier operation (sometimes one that failed or is itself a reversal).
+                String target = keyOf(moneyOps.get(r.nextInt(moneyOps.size())));
+                if (r.nextInt(15) == 0) target = "missing-" + key;
+                op = new Reverse(target, r.nextBoolean() ? null : BigDecimal.valueOf(r.nextInt(1, 4_001), 2), key);
             } else if (kind < 25) {
                 op = new Deposit(a, amount, key);
             } else if (kind < 37) {
@@ -253,7 +309,8 @@ class LedgerModelTest {
                     default -> new ExpireHold(holdKey);
                 };
             }
-            if (op instanceof Deposit || op instanceof Withdraw || op instanceof Transfer || op instanceof Linked) moneyOps.add(op);
+            if (op instanceof Deposit || op instanceof Withdraw || op instanceof Transfer || op instanceof Linked
+                    || op instanceof Reverse) moneyOps.add(op);
             ops.add(op);
         }
         return ops;
@@ -265,6 +322,7 @@ class LedgerModelTest {
             case Withdraw w -> w.key();
             case Transfer t -> t.key();
             case Linked l -> l.key();
+            case Reverse v -> v.key();
             default -> throw new IllegalArgumentException(op.toString());
         };
     }
@@ -287,15 +345,16 @@ class LedgerModelTest {
     private Failure run(List<Op> ops) {
         List<UUID> ids = resetAccounts();
         Map<String, UUID> holdIds = new HashMap<>();
+        Map<String, UUID> txIds = new HashMap<>();
         Model model = new Model();
         for (int step = 0; step < ops.size(); step++) {
             Op op = ops.get(step);
             Outcome expected = model.apply(op);
             Outcome actual;
             try {
-                execute(op, ids, holdIds);
+                execute(op, ids, holdIds, txIds);
                 actual = Outcome.OK;
-            } catch (HoldNotFoundException | AccountNotFoundException e) {
+            } catch (HoldNotFoundException | AccountNotFoundException | TransactionNotFoundException e) {
                 actual = Outcome.NOT_FOUND;
             } catch (BankingException e) {
                 actual = Outcome.REJECTED;
@@ -313,14 +372,20 @@ class LedgerModelTest {
         return null;
     }
 
-    private void execute(Op op, List<UUID> ids, Map<String, UUID> holdIds) {
+    private void execute(Op op, List<UUID> ids, Map<String, UUID> holdIds, Map<String, UUID> txIds) {
         switch (op) {
-            case Deposit d -> banking.deposit(ids.get(d.account()), new MoneyRequest(d.amount(), d.key()));
-            case Withdraw w -> banking.withdraw(ids.get(w.account()), new MoneyRequest(w.amount(), w.key()));
-            case Transfer t -> banking.transfer(new TransferRequest(ids.get(t.from()), ids.get(t.to()), t.amount(), t.key()));
+            case Deposit d -> txIds.putIfAbsent(d.key(),
+                    banking.deposit(ids.get(d.account()), new MoneyRequest(d.amount(), d.key())).id());
+            case Withdraw w -> txIds.putIfAbsent(w.key(),
+                    banking.withdraw(ids.get(w.account()), new MoneyRequest(w.amount(), w.key())).id());
+            case Transfer t -> txIds.putIfAbsent(t.key(), banking.transfer(
+                    new TransferRequest(ids.get(t.from()), ids.get(t.to()), t.amount(), t.key())).id());
+            case Reverse v -> txIds.putIfAbsent(v.key(), banking.reverse(
+                    txIds.getOrDefault(v.originalKey(), UUID.nameUUIDFromBytes(v.originalKey().getBytes())),
+                    new ReversalRequest(v.amount(), v.key())).id());
             case Linked l -> banking.linkedTransfer(new LinkedTransferRequest(l.legs().stream()
                     .map(leg -> new LinkedTransferRequest.Leg(ids.get(leg.from()), ids.get(leg.to()), leg.amount()))
-                    .toList(), l.key()));
+                    .toList(), l.key()));  // a group is not one reversible transaction
             case CreateHold c -> holdIds.put(c.key(), holds.create(new CreateHoldRequest(
                     ids.get(c.from()), ids.get(c.to()), c.amount(), c.key(), null)).id());
             case PostHold p -> holds.post(holdId(p.holdKey(), holdIds), p.amount());
