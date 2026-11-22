@@ -16,9 +16,11 @@ public class LedgerController {
     private final AccessService access;
     private final LedgerSealer sealer;
     private final org.springframework.jdbc.core.JdbcTemplate jdbc;
+    private final SealSigner signer;
 
     public LedgerController(ChartOfAccounts chart, AccessService access, LedgerSealer sealer,
-                            org.springframework.jdbc.core.JdbcTemplate jdbc) {
+                            org.springframework.jdbc.core.JdbcTemplate jdbc, SealSigner signer) {
+        this.signer = signer;
         this.chart = chart;
         this.access = access;
         this.sealer = sealer;
@@ -30,6 +32,13 @@ public class LedgerController {
     public LedgerSealer.Seal sealHead() {
         access.requireAdmin();
         return sealer.head();
+    }
+
+    /** The public keys that verify seal signatures. Publish them, so others can check the chain. */
+    @GetMapping("/seals/public-keys")
+    public java.util.List<SealSigner.PublishedKey> sealPublicKeys() {
+        access.requireAdmin();
+        return signer.publicKeys();
     }
 
     /** Recomputes the whole chain and reports the first broken seal, if any. */

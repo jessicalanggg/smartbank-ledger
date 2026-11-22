@@ -56,6 +56,12 @@ smartbank:
     allow-private-targets: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:false}
   ledger:
     seal-interval: PT5S
+    # Ed25519 keys (base64 DER) that sign every seal; the private key must never be in the database.
+    # Without them seals are only hash-chained, and a warning is logged at startup.
+    seal-signing:
+      private-key: ${SEAL_SIGNING_PRIVATE_KEY:}
+      public-key: ${SEAL_SIGNING_PUBLIC_KEY:}
+      previous-public-keys: ${SEAL_SIGNING_PREVIOUS_PUBLIC_KEYS:}
     # Balance checkpoints: one per period boundary (UTC), taken once the boundary is
     # older than the horizon. The horizon must be well above transaction_timeout.
     checkpoint-period: P1D

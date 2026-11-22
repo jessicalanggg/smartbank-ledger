@@ -35,6 +35,13 @@ import java.util.*;
  * outside the database: the sealer logs every new head, and administrators can read
  * it from the API to record elsewhere.
  *
+ * With signing keys configured ({@link SealSigner}), every new seal's hash is also
+ * signed with an Ed25519 key the database never holds, so even a complete rewrite
+ * of the chain by someone with full database access fails verification: it cannot
+ * carry valid signatures, and the latest seal must always be signed. When signing
+ * is first switched on, the sealer appends a seal covering no new transactions,
+ * signed, so the history before it is covered too.
+ *
  * Sealing happens after commit and in the background, so posting never waits on a
  * single chain head. A PostgreSQL advisory lock lets only one app instance seal at
  * a time. Transactions are only final, and only sealable, once committed; anything
@@ -50,19 +57,35 @@ public class LedgerSealer {
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
     private final Clock clock;
+    private final SealSigner signer;
 
-    public LedgerSealer(JdbcTemplate jdbc, TransactionTemplate transactions, Clock clock) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public LedgerSealer(JdbcTemplate jdbc, TransactionTemplate transactions, Clock clock, SealSigner signer) {
         this.jdbc = jdbc;
         this.transactions = transactions;
         this.clock = clock;
+        this.signer = signer;
     }
 
-    public record Seal(long seq, String prevHash, String hash, int transactionCount, Instant sealedAt) { }
+    /** Without signing: only the hash chain is checked. */
+    public LedgerSealer(JdbcTemplate jdbc, TransactionTemplate transactions, Clock clock) {
+        this(jdbc, transactions, clock, SealSigner.disabled());
+    }
+
+    /** keyId and signature are null for seals made while signing was off. */
+    public record Seal(long seq, String prevHash, String hash, int transactionCount, Instant sealedAt,
+                       String keyId, String signature) { }
 
     /** Result of checking the whole chain. {@code firstBrokenSeal} is null when it is intact. */
     public record Verification(int sealsChecked, int transactionsChecked, Long firstBrokenSeal, String problem,
                                String headHash) {
         public boolean intact() { return firstBrokenSeal == null; }
+    }
+
+    /** At startup, so a newly configured signing key covers existing history at once. */
+    @org.springframework.context.event.EventListener(org.springframework.boot.context.event.ApplicationReadyEvent.class)
+    public void sealAtStartup() {
+        run();
     }
 
     @Scheduled(fixedDelayString = "${smartbank.ledger.seal-interval:PT5S}")
@@ -93,16 +116,23 @@ public class LedgerSealer {
                 SELECT t.id FROM banking_transactions t
                 WHERE NOT EXISTS (SELECT 1 FROM ledger_sealed_transactions s WHERE s.transaction_id = t.id)
                 ORDER BY t.created_at, t.id LIMIT ?""", UUID.class, MAX_PER_SEAL);
-        if (ids.isEmpty()) return null;
+        // Nothing new to seal, unless signing was just switched on and the head is
+        // unsigned: then an empty, signed seal vouches for everything before it.
+        if (ids.isEmpty() && !(signer.enabled() && head != null && head.signature() == null)) return null;
         long seq = head == null ? 1 : head.seq() + 1;
         String prev = head == null ? GENESIS : head.hash();
         String hash = sealHash(seq, prev, canonical(ids));
+        SealSigner.Signed signed = signer.enabled() ? signer.sign(seq, hash) : null;
         Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
-        jdbc.update("INSERT INTO ledger_seals (seq, prev_hash, hash, transaction_count, sealed_at) VALUES (?, ?, ?, ?, ?)",
-                seq, prev, hash, ids.size(), Timestamp.from(now));
+        jdbc.update("""
+                INSERT INTO ledger_seals (seq, prev_hash, hash, transaction_count, sealed_at, key_id, signature)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                seq, prev, hash, ids.size(), Timestamp.from(now),
+                signed == null ? null : signed.keyId(), signed == null ? null : signed.signature());
         jdbc.batchUpdate("INSERT INTO ledger_sealed_transactions (transaction_id, seal_seq) VALUES (?, ?)",
                 ids.stream().map(id -> new Object[] { id, seq }).toList());
-        return new Seal(seq, prev, hash, ids.size(), now);
+        return new Seal(seq, prev, hash, ids.size(), now,
+                signed == null ? null : signed.keyId(), signed == null ? null : signed.signature());
     }
 
     /** The latest seal, or null if nothing is sealed yet. */
@@ -135,10 +165,27 @@ public class LedgerSealer {
             }
             if (!recomputed.equals(seal.hash()))
                 return broken(checked, transactionsChecked, seal.seq(), "sealed transactions or entries were changed");
+            if (seal.signature() != null) {
+                switch (signer.verify(seal.seq(), seal.hash(), seal.keyId(), seal.signature())) {
+                    case INVALID -> {
+                        return broken(checked, transactionsChecked, seal.seq(), "its signature does not match");
+                    }
+                    case UNKNOWN_KEY -> {
+                        if (signer.enabled())
+                            return broken(checked, transactionsChecked, seal.seq(), "it is signed with an unknown key");
+                    }
+                    case VALID -> { }
+                }
+            }
             prev = seal.hash();
             checked++;
             transactionsChecked += ids.size();
         }
+        // A rewritten chain would end in a seal no one could sign: the head must be signed.
+        // (Right after signing is first switched on, this holds until the sealer has
+        // added its signed seal, which it does at startup.)
+        if (signer.enabled() && !seals.isEmpty() && seals.get(seals.size() - 1).signature() == null)
+            return broken(checked, transactionsChecked, seals.get(seals.size() - 1).seq(), "the latest seal is not signed");
         return new Verification(checked, transactionsChecked, null, null, prev);
     }
 
@@ -148,7 +195,8 @@ public class LedgerSealer {
 
     private static Seal seal(ResultSet rs) throws SQLException {
         return new Seal(rs.getLong("seq"), rs.getString("prev_hash"), rs.getString("hash"),
-                rs.getInt("transaction_count"), rs.getTimestamp("sealed_at").toInstant());
+                rs.getInt("transaction_count"), rs.getTimestamp("sealed_at").toInstant(),
+                rs.getString("key_id"), rs.getString("signature"));
     }
 
     /**

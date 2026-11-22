@@ -28,6 +28,9 @@ services:
       WEBHOOK_ALLOW_HTTP: ${WEBHOOK_ALLOW_HTTP:-true}
       WEBHOOK_ALLOW_PRIVATE_TARGETS: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:-true}
       DEMO_PASSWORD: ${DEMO_PASSWORD:-LocalDemoPass123!}
+      # Local-only Ed25519 key pair for signing ledger seals; generate your own for anything else.
+      SEAL_SIGNING_PRIVATE_KEY: ${SEAL_SIGNING_PRIVATE_KEY:-MC4CAQAwBQYDK2VwBCIEIKVrMfDvqKhG9ApR3zc5SJCsvcnh1TNVmK8IWjiRXJWt}
+      SEAL_SIGNING_PUBLIC_KEY: ${SEAL_SIGNING_PUBLIC_KEY:-MCowBQYDK2VwAyEAZfItwPtQF5mv0N+QGzlgRcHWyHaD2CHkpFJVZA2mA4U=}
     ports:
       - "127.0.0.1:8081:8080"
     depends_on:
