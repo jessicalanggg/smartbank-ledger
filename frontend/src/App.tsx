@@ -9,10 +9,8 @@ import {
     History,
     ShieldCheck,
     Clock,
-    Bot,
 } from "lucide-react";
 import Holds from "./Holds";
-import Mandates from "./Mandates";
 import {
     accounts,
     deposit,
@@ -69,7 +67,7 @@ export default function App() {
     const [transferUncertain, setTransferUncertain] = useState(false);
     const transferInFlight = useRef(false);
     const pendingMoneyAction = useRef<{ action: string; accountId: string; amount: string; requestKey: string } | null>(null);
-    const [page, setPage] = useState<"overview" | "transactions" | "holds" | "agents">("overview");
+    const [page, setPage] = useState<"overview" | "transactions" | "holds">("overview");
     const [filter, setFilter] = useState("all");
     const [search, setSearch] = useState("");
     const active = items.find((a) => a.id === selected);
@@ -299,13 +297,6 @@ export default function App() {
                 >
                     <Clock size={19} /> Holds
                 </button>
-                <button
-                    type="button"
-                    className={`nav ${page === "agents" ? "active" : ""}`}
-                    onClick={() => setPage("agents")}
-                >
-                    <Bot size={19} /> AI agents
-                </button>
                 <div className="side-bottom">
                     <span>Signed in as</span>
                     <strong>{email}</strong>
@@ -336,18 +327,14 @@ export default function App() {
                                 ? "Your accounts"
                                 : page === "holds"
                                     ? "Holds"
-                                    : page === "agents"
-                                        ? "AI agents"
-                                        : "Transactions"}
+                                    : "Transactions"}
                         </h1>
                         <p>
                             {page === "overview"
                                 ? "Welcome to your SmartBank dashboard."
                                 : page === "holds"
                                     ? "Reserve money now, settle it later."
-                                    : page === "agents"
-                                        ? "Let AI agents pay for you, within limits you set."
-                                        : "Review activity for your selected account."}
+                                    : "Review activity for your selected account."}
                         </p>
                     </div>
                     <button
@@ -587,9 +574,6 @@ export default function App() {
                         onSelect={setSelected}
                         onChanged={() => load(token)}
                     />
-                )}
-                {page === "agents" && (
-                    <Mandates token={token} accounts={items} onChanged={() => load(token)} />
                 )}
                 {page === "transactions" && (
                     <section className="panel history-page">

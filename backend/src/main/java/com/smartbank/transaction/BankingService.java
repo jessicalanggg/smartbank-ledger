@@ -402,10 +402,6 @@ public class BankingService {
     }
 
     private TransactionResponse postTransfer(TransferRequest request) {
-        return postTransfer(request, null);
-    }
-
-    private TransactionResponse postTransfer(TransferRequest request, UUID agentMandateId) {
         UUID from = request.fromAccountId(), to = request.toAccountId();
         BigDecimal amount = request.amount();
         // Both accounts in one query.
@@ -418,8 +414,8 @@ public class BankingService {
             throw new BankingException("Cross-currency transfers are not supported");
         currencies.requireValidAmount(amount, source.getCurrency());
         failFastIfUnavailable(source, amount);
-        TransactionResponse tx = writer.post(new BankingTransaction(TransactionType.TRANSFER, from, to, amount,
-                source.getCurrency(), request.requestKey()).initiatedBy(Initiator.current()).byAgent(agentMandateId));
+        TransactionResponse tx = record(TransactionType.TRANSFER, from, to, amount, source.getCurrency(),
+                request.requestKey());
         // Critical section: row locks from here until commit, taken in UUID order, in one round trip.
         var debit = new PostingWriter.BalanceChange(from, amount.negate());
         var credit = new PostingWriter.BalanceChange(to, amount);
@@ -428,16 +424,6 @@ public class BankingService {
         if (!applied[debitFirst ? 0 : 1])
             throw new BankingException("Insufficient funds");
         return tx;
-    }
-
-    /**
-     * A transfer an AI agent makes under a mandate, inside the caller's transaction
-     * (which has already checked and used up the mandate's limits). The same posting
-     * as {@link #transfer}, with the mandate recorded on the transaction.
-     */
-    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.MANDATORY)
-    public TransactionResponse postAgentTransfer(UUID from, UUID to, BigDecimal amount, String requestKey, UUID mandateId) {
-        return postTransfer(new TransferRequest(from, to, amount, requestKey), mandateId);
     }
 
     /** Rejects early on an unlocked read. Not authoritative: the conditional debit is. */
@@ -485,13 +471,7 @@ public class BankingService {
      */
     TransactionResponse record(TransactionType type, UUID from, UUID to,
             BigDecimal amount, String currency, String key) {
-        return record(type, from, to, amount, currency, key, null);
-    }
-
-    TransactionResponse record(TransactionType type, UUID from, UUID to,
-            BigDecimal amount, String currency, String key, UUID agentMandateId) {
-        return writer.post(new BankingTransaction(type, from, to, amount, currency, key)
-                .initiatedBy(Initiator.current()).byAgent(agentMandateId));
+        return writer.post(new BankingTransaction(type, from, to, amount, currency, key).initiatedBy(Initiator.current()));
     }
 
     /** The double-entry postings for a transaction; their amounts sum to zero. */

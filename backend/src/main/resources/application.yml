@@ -3,7 +3,7 @@ spring:
     name: smartbank
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/smartbank}
-    # The app runs as smartbank_app, which can add to the ledger but not rewrite it (V17).
+    # The app runs as smartbank_app, which can add to the ledger but not rewrite it (V16).
     username: ${DB_APP_USER:smartbank_app}
     password: ${DB_APP_PASSWORD:local_dev_app_only}
     hikari:

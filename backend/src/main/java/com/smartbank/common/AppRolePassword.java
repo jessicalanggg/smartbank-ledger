@@ -14,7 +14,7 @@ import java.sql.Statement;
 
 /**
  * After migrations, gives the application's database role (smartbank_app, created by
- * V17) its password and lets it log in. Runs as the migration user, so the secret
+ * V16) its password and lets it log in. Runs as the migration user, so the secret
  * lives only in configuration, never in a migration. With no password configured it
  * does nothing, for databases where an administrator manages the role.
  */

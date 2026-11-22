@@ -21,11 +21,9 @@ public class HoldController {
     private final AccessService access;
     private final IdempotencyService idempotency;
     private final com.smartbank.account.AccountRepository accounts;
-    private final org.springframework.jdbc.core.JdbcTemplate jdbc;
 
     public HoldController(HoldService holds, AccessService access, IdempotencyService idempotency,
-                          com.smartbank.account.AccountRepository accounts, org.springframework.jdbc.core.JdbcTemplate jdbc) {
-        this.jdbc = jdbc;
+                          com.smartbank.account.AccountRepository accounts) {
         this.holds = holds;
         this.access = access;
         this.idempotency = idempotency;
@@ -68,27 +66,15 @@ public class HoldController {
         return hold;
     }
 
-    /**
-     * A hold for an agent payment over its limits is decided by the payer's owner
-     * (approve or decline), never captured or released by the payee.
-     */
-    private void requireNotAwaitingApproval(UUID holdId) {
-        if (Boolean.TRUE.equals(jdbc.queryForObject(
-                "SELECT EXISTS (SELECT 1 FROM agent_payments WHERE hold_id = ?)", Boolean.class, holdId)))
-            throw new BankingException("This hold is an agent payment awaiting its account owner's approval");
-    }
-
     @PostMapping("/holds/{id}/post")
     public HoldResponse post(@PathVariable UUID id, @Valid @RequestBody(required = false) PostHoldRequest request) {
         access.requireOwner(holds.get(id).toAccountId());
-        requireNotAwaitingApproval(id);
         return holds.post(id, request == null ? null : request.amount());
     }
 
     @PostMapping("/holds/{id}/void")
     public HoldResponse voidHold(@PathVariable UUID id) {
         access.requireOwner(holds.get(id).toAccountId());
-        requireNotAwaitingApproval(id);
         return holds.voidHold(id);
     }
 

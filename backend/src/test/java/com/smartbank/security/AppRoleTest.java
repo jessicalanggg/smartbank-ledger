@@ -42,7 +42,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 
 /**
- * The application running as the restricted smartbank_app role (V17), as it does
+ * The application running as the restricted smartbank_app role (V16), as it does
  * outside tests. Every other test connects as the database owner so it can set up
  * data directly; this one proves the role has every privilege the app needs, and
  * none that would let it rewrite the books.
@@ -142,7 +142,7 @@ class AppRoleTest {
                 "UPDATE ledger_seals SET hash = hash",
                 "DELETE FROM outbox_events",
                 "DELETE FROM accounts",
-                "UPDATE agent_mandates SET daily_limit = daily_limit * 10",
+                "DELETE FROM holds",
                 "CREATE TABLE sneaky (id INT)",
                 "ALTER ROLE smartbank_app SUPERUSER",
                 "SET session_replication_role = replica");
@@ -167,7 +167,7 @@ class AppRoleTest {
                 ORDER BY 1""", String.class);
         assertEquals(List.of("idempotency_keys", "rate_limit_buckets"), deletable);
         Set<String> history = Set.of("banking_transactions", "ledger_entries", "outbox_events", "ledger_seals",
-                "ledger_sealed_transactions", "ledger_checkpoints", "ledger_checkpoint_runs", "fx_rates", "agent_mandate_payees");
+                "ledger_sealed_transactions", "ledger_checkpoints", "ledger_checkpoint_runs", "fx_rates");
         // (banking_transactions grants UPDATE on one column only, for row locks; its trigger refuses updates.)
         for (String table : history)
             assertFalse(owner.queryForObject("SELECT has_table_privilege('smartbank_app', ?, 'UPDATE')", Boolean.class, table),
@@ -208,20 +208,6 @@ class AppRoleTest {
                 "{\"fromAccountId\":\"%s\",\"toAccountId\":\"%s\",\"amount\":\"100.00\"}".formatted(wallet, dollars), 201);
         call(post("/api/v1/fx/transfers"), customer, "{\"quoteId\":\"" + JsonPath.read(quote, "$.id") + "\"}", 201);
 
-        // An agent mandate: a payment within the limits, one over them approved, then revocation.
-        String created = call(post("/api/v1/mandates"), customer, """
-                {"accountId":"%s","name":"Agent","perPaymentLimit":"20.00","dailyLimit":"50.00"}""".formatted(wallet), 201);
-        String key = JsonPath.read(created, "$.apiKey");
-        String shopNumber = owner.queryForObject("SELECT account_number FROM accounts WHERE id = ?", String.class, shop);
-        for (String amount : List.of("10.00", "30.00"))
-            mvc.perform(post("/api/v1/agent/payments").header("Authorization", "Agent " + key)
-                    .header("Idempotency-Key", UUID.randomUUID().toString()).contentType(MediaType.APPLICATION_JSON)
-                    .content("{\"toAccountNumber\":\"%s\",\"amount\":\"%s\",\"intent\":\"test\"}".formatted(shopNumber, amount)))
-                    .andReturn();
-        String waiting = call(get("/api/v1/agent-payments/awaiting-approval"), customer, null, 200);
-        call(post("/api/v1/agent-payments/" + JsonPath.read(waiting, "$[0].id") + "/approve"), customer, null, 200);
-        call(post("/api/v1/mandates/" + JsonPath.read(created, "$.mandate.id") + "/revoke"), customer, null, 200);
-
         // Webhooks: an endpoint, then a delivery attempt (to a closed port, so it is retried later).
         call(post("/api/v1/webhook-endpoints"), customer, "{\"url\":\"http://127.0.0.1:9/hook\"}", 201);
         call(post("/api/v1/accounts/" + wallet + "/deposits"), customer, "{\"amount\":\"1.00\"}", 201);
@@ -239,8 +225,6 @@ class AppRoleTest {
         idempotencyPruner.pruneExpired(Instant.now().plus(Duration.ofDays(2)));
         rateLimitPruner.run();
 
-        assertEquals(1, owner.queryForObject(
-                "SELECT COUNT(*) FROM agent_payments WHERE status = 'APPROVED'", Integer.class));
         var report = reconciliation.run();
         assertTrue(report.isClean(), () -> "Books out of balance: " + report);
     }

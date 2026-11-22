@@ -18,7 +18,7 @@ services:
     build: ../backend
     environment:
       DB_URL: jdbc:postgresql://db:5432/smartbank
-      # Migrations run as the owner; the app connects as smartbank_app (see V17).
+      # Migrations run as the owner; the app connects as smartbank_app (see V16).
       DB_USER: smartbank
       DB_PASSWORD: ${DB_PASSWORD:-local_dev_only}
       DB_APP_PASSWORD: ${DB_APP_PASSWORD:-local_dev_app_only}

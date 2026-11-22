@@ -13,8 +13,7 @@ import java.math.BigDecimal;
  * outbox holds exactly one event per posted transaction and per hold state, debits
  * equal credits within each currency, and every entry lands on exactly one account
  * in the chart of accounts, the hash chain of seals is intact, and every balance
- * checkpoint matches the entries before it, and agent payments stayed within their
- * mandates and match their transfers.
+ * checkpoint matches the entries before it.
  * Runs in one REPEATABLE READ snapshot so concurrent postings cannot make a
  * consistent ledger look inconsistent.
  */
@@ -39,15 +38,14 @@ public class LedgerReconciliation {
                          int accountsWithWrongPendingAmounts, int postedHoldsNotMatchingTransfer,
                          int transactionsWithoutExactlyOneEvent, int holdsWithWrongEvents,
                          int currenciesOutOfBalance, int entriesWithoutChartAccount, int customerAccountsWithoutChartAccount,
-                         int brokenSeals, int inconsistentCheckpoints, int agentPaymentsOutOfLine) {
+                         int brokenSeals, int inconsistentCheckpoints) {
         public boolean isClean() {
             return ledgerTotal.signum() == 0 && unbalancedTransactions == 0
                     && transactionsWithoutEntries == 0 && accountsOutOfBalance == 0
                     && accountsWithWrongPendingAmounts == 0 && postedHoldsNotMatchingTransfer == 0
                     && transactionsWithoutExactlyOneEvent == 0 && holdsWithWrongEvents == 0
                     && currenciesOutOfBalance == 0 && entriesWithoutChartAccount == 0
-                    && customerAccountsWithoutChartAccount == 0 && brokenSeals == 0 && inconsistentCheckpoints == 0
-                    && agentPaymentsOutOfLine == 0;
+                    && customerAccountsWithoutChartAccount == 0 && brokenSeals == 0 && inconsistentCheckpoints == 0;
         }
     }
 
@@ -135,36 +133,7 @@ public class LedgerReconciliation {
                       AND j.created_at >= COALESCE(x.prev_as_of, '-infinity') AND j.created_at < x.as_of) d ON TRUE
                 WHERE COALESCE(x.prev_debits, 0) + d.debits <> x.debits
                    OR COALESCE(x.prev_credits, 0) + d.credits <> x.credits""", Integer.class);
-        // Agent payments: each day's recorded usage equals what was paid that day, what was
-        // paid without asking stayed within the daily limit, every paid payment matches its
-        // transfer, and every transfer that names a mandate is a paid agent payment.
-        Integer agents = jdbc.queryForObject("""
-                SELECT
-                  (SELECT COUNT(*) FROM agent_mandate_usage u
-                   FULL JOIN (SELECT mandate_id, usage_day,
-                                     COALESCE(SUM(amount) FILTER (WHERE status = 'POSTED'), 0) AS auto,
-                                     COALESCE(SUM(amount) FILTER (WHERE status = 'APPROVED'), 0) AS approved
-                              FROM agent_payments WHERE status IN ('POSTED', 'APPROVED')
-                              GROUP BY mandate_id, usage_day) p
-                     ON p.mandate_id = u.mandate_id AND p.usage_day = u.day
-                   LEFT JOIN agent_mandates m ON m.id = COALESCE(u.mandate_id, p.mandate_id)
-                   WHERE COALESCE(u.auto_spent, 0) <> COALESCE(p.auto, 0)
-                      OR COALESCE(u.approved_spent, 0) <> COALESCE(p.approved, 0)
-                      OR COALESCE(u.auto_spent, 0) > m.daily_limit)
-                + (SELECT COUNT(*) FROM agent_payments p
-                   JOIN agent_mandates m ON m.id = p.mandate_id
-                   LEFT JOIN banking_transactions t ON t.id = p.transaction_id
-                   WHERE p.status IN ('POSTED', 'APPROVED')
-                     AND (t.id IS NULL OR t.transaction_type <> 'TRANSFER' OR t.agent_mandate_id IS DISTINCT FROM p.mandate_id
-                          OR t.amount <> p.amount OR t.source_account_id <> m.account_id
-                          OR t.destination_account_id <> p.payee_account_id
-                          OR (p.status = 'POSTED' AND p.amount > m.per_payment_limit)))
-                + (SELECT COUNT(*) FROM banking_transactions t
-                   WHERE t.agent_mandate_id IS NOT NULL
-                     AND NOT EXISTS (SELECT 1 FROM agent_payments p
-                                     WHERE p.transaction_id = t.id AND p.status IN ('POSTED', 'APPROVED')))""",
-                Integer.class);
         return new Report(total, unbalanced, withoutEntries, outOfBalance, wrongPending, badPostings,
-                missingEvents, holdEvents, currencies, unmapped, customersWithoutChart, brokenSeals, checkpoints, agents);
+                missingEvents, holdEvents, currencies, unmapped, customersWithoutChart, brokenSeals, checkpoints);
     }
 }

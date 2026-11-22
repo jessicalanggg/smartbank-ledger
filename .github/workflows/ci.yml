@@ -36,19 +36,3 @@ jobs:
       - run: npm ci
       - name: Type-check and build
         run: npm run build
-
-  agent-demo:
-    name: Agent demo type-check
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: agent-demo
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: agent-demo/package-lock.json
-      - run: npm ci
-      - run: npm run typecheck

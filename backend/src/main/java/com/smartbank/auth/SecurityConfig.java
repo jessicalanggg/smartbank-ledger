@@ -33,23 +33,18 @@ public class SecurityConfig {
     @Bean SecurityFilterChain securityFilterChain(HttpSecurity http,
             org.springframework.beans.factory.ObjectProvider<com.smartbank.ratelimit.RateLimiter> limiter,
             org.springframework.beans.factory.ObjectProvider<com.smartbank.ratelimit.RateLimits> limits,
-            com.fasterxml.jackson.databind.ObjectMapper mapper,
-            org.springframework.jdbc.core.JdbcTemplate jdbc) throws Exception {
+            com.fasterxml.jackson.databind.ObjectMapper mapper) throws Exception {
         // Rate limiting runs after the bearer token is validated, so limits follow the user.
         var rateLimiter = limiter.getIfAvailable();
         var rateLimits = limits.getIfAvailable();
         if (rateLimiter != null && rateLimits != null && rateLimits.apiPerUser() != null)
             http.addFilterAfter(new com.smartbank.ratelimit.RateLimitFilter(rateLimiter, rateLimits, mapper),
                     org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter.class);
-        // AI agents authenticate with a mandate's API key, and only on the agent API.
-        http.addFilterBefore(new com.smartbank.agent.AgentKeyFilter(jdbc, mapper),
-                org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter.class);
         return http.csrf(csrf -> csrf.disable())
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(a -> a
                 .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/register").permitAll()
-                .requestMatchers("/api/v1/agent/**").hasAuthority(com.smartbank.agent.AgentAuthentication.AUTHORITY)
                 .anyRequest().authenticated())
             .oauth2ResourceServer(o -> o.jwt(j -> {}))
             .build();
