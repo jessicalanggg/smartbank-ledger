@@ -11,7 +11,7 @@
 - **The database refuses bad money states, even if the code is wrong.** Every transaction's debits must equal its credits within each currency; history is append-only; balances can never go negative; an agent's spending can never exceed its daily limit. These are PostgreSQL constraints and triggers, not application checks.
 - **AI agents get a budget, not a blank check.** A customer gives an agent a key tied to one account, with per-payment and daily limits. The limit is checked and used up in the same transaction as the payment, so 50 agents racing for the last of a budget cannot overspend it. Anything over a limit waits for the customer's approval, and revoking is immediate.
 - **Every request is safe to retry.** Idempotency keys make each payment happen exactly once, even when the server stops between posting and answering.
-- **History is tamper-evident.** Committed transactions are sealed into a SHA-256 hash chain, which catches a rewrite that every balance check would miss.
+- **History cannot be quietly rewritten.** The app connects as a database role that can add to the ledger but cannot update, delete or disable the triggers that protect it. Committed transactions are sealed into a SHA-256 hash chain, and each seal is signed with an Ed25519 key the database never holds, so even someone with full database access who rewrites the whole chain is caught.
 - **It is tested like infrastructure.** Thousands of random concurrent operations checked against an independent model, network cuts and `SIGKILL`s of PostgreSQL under load, and reconciliation of every invariant after every test.
 
 ## Architecture
@@ -37,6 +37,8 @@ flowchart LR
 | PostgreSQL killed with `SIGKILL` twice under load | Every acknowledged transfer survives, nothing posts twice | [fault testing](docs/fault-testing.md) |
 | 4,800 random operations per run against an independent model | Match after every step; failures shrink to a minimal case | [`LedgerModelTest`](backend/src/test/java/com/smartbank/fault/LedgerModelTest.java) |
 | A transfer, its entries and both balances altered consistently | Missed by every balance check, caught by the hash chain | [`LedgerSealTest`](backend/src/test/java/com/smartbank/ledger/LedgerSealTest.java) |
+| The whole chain rewritten by someone with full database access | Caught by seal signatures, with no external record | [`SealSignatureTest`](backend/src/test/java/com/smartbank/ledger/SealSignatureTest.java) |
+| The app's own database role tries to update, delete, truncate or disable triggers on history | All 17 attempts refused, while every operation still works | [`AppRoleTest`](backend/src/test/java/com/smartbank/security/AppRoleTest.java) |
 | Database round trips per transfer | 17 → 6, measured with injected network delay | [benchmarks](docs/benchmarks.md#round-trips-per-operation) |
 | Batched posting, every transfer paying one account | About 5–6× the throughput, p99 under 80 ms | [benchmarks](docs/benchmarks.md#batched-posting-group-commit) |
 
@@ -59,11 +61,11 @@ Try it with Claude: [agent-demo](agent-demo/) is an MCP server exposing this API
 
 ## Features
 
-- **Ledger:** double-entry with a chart of accounts and per-currency trial balances; balance checkpoints and statements; multi-currency with quoted FX; reversals that never edit history; a hash chain over all history.
+- **Ledger:** double-entry with a chart of accounts and per-currency trial balances; balance checkpoints and statements; multi-currency with quoted FX; reversals that never edit history; a signed hash chain over all history.
 - **Money movement:** deposits, withdrawals and transfers; two-phase transfers (holds) with capture, release and expiry; linked transfers that post all or nothing; batched posting (group commit).
 - **AI agents:** spending mandates with per-payment and daily limits, allowed payees, owner approval above limits, immediate revocation and a full audit trail; an MCP server.
 - **Reliability:** idempotency keys scoped per user; short, deadlock-free locking; a transactional outbox with signed, retried webhooks; reconciliation of every invariant.
-- **Security:** JWT and BCrypt; ownership checks on every account; per-user, per-agent and per-IP rate limits in PostgreSQL; SSRF-guarded webhooks with encrypted, rotatable secrets.
+- **Security:** the app runs as a database role that cannot rewrite history; JWT and BCrypt; ownership checks on every account; per-user, per-agent and per-IP rate limits in PostgreSQL; SSRF-guarded webhooks with encrypted, rotatable secrets.
 
 ## Documentation
 
@@ -120,7 +122,6 @@ Run the tests with `cd backend && mvn test` (JDK 21), or entirely in Docker as d
 Not implemented: refresh tokens or token revocation, MFA, account opening, pagination beyond the newest 100 transactions, FX revaluation and FX reversals. The demo password, JWT secret and webhook encryption key in `infra/compose.yml` are for local use only, and Compose allows http and private webhook targets so a receiver on your machine works; production must set `WEBHOOK_ENCRYPTION_KEY` and leave `WEBHOOK_ALLOW_HTTP` and `WEBHOOK_ALLOW_PRIVATE_TARGETS` off.
 
 Next steps:
-- Run the app as a database role that cannot update, delete or disable triggers on ledger tables (today it connects as the tables' owner), and sign seals with a key the database does not hold.
 - Record a run of the Claude agent demo for this README.
 - Re-run the throughput benchmarks on a quiet machine.
 - Close the remaining DNS-rebinding window for webhooks with an egress proxy, and allow rotating the secret-encryption key.

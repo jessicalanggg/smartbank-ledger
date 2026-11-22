@@ -24,7 +24,8 @@ All endpoints except health, login, register and the agent API need `Authorizati
 | `GET` | `/api/v1/ledger/transactions/{id}/journal` | A transaction's debit and credit lines. Admin only |
 | `GET` | `/api/v1/ledger/transactions/{id}` | Who started the transaction and which seal covers it. Admin only |
 | `GET` | `/api/v1/ledger/seals/head` | The latest seal; record its hash outside the database. Admin only |
-| `GET` | `/api/v1/ledger/seals/verify` | Recomputes the hash chain and reports the first broken seal. Admin only |
+| `GET` | `/api/v1/ledger/seals/public-keys` | The Ed25519 public keys that verify seal signatures, with their key ids. Admin only |
+| `GET` | `/api/v1/ledger/seals/verify` | Recomputes the hash chain, checks every signature, and reports the first broken seal. Admin only |
 | `POST` | `/api/v1/transactions/{id}/reversals` | Optional `{ "amount" }`; without it, whatever is not yet reversed. Transfers: payee or admin. Deposits and withdrawals: admin |
 | `POST` | `/api/v1/transfers/linked` | `{ "transfers": [ { "fromAccountId", "toAccountId", "amount" }, … ] }`, 1–20 legs, all or nothing. Caller must own every source |
 | `GET` | `/api/v1/accounts/{id}/transactions` | Newest 100, owner only |
