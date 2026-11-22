@@ -13,6 +13,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Linked transfers.** Up to 20 transfers that post together or not at all, such as "charge the customer, pay the merchant, take a fee". Funds are checked on each account's net change across the group, every leg gets its own ledger entries and event tagged with the group's `linkId`, and the whole group is written in one SQL statement.
 - **Reversals.** Mistakes are corrected with a new `REVERSAL` posting that points at the original and moves money back along the same path, never by editing history. Partial reversals are allowed but never exceed the original in total, enforced by a database trigger that locks the original at commit. A payee can refund a transfer; only an administrator can reverse deposits and withdrawals.
 - **Tamper-evident history and an audit trail.** Every transaction records who started it. A background job seals committed transactions into a SHA-256 hash chain (each seal covers its transactions, their entries and the previous seal), so any change to sealed history, even with the database's append-only triggers switched off, is detected. Reconciliation verifies the chain on every run.
+- **Balance checkpoints and statements.** Each account's running debit and credit totals are checkpointed per day, so a balance at any moment is the latest checkpoint plus the few entries since. Customers get statements with an opening balance, every posting with a running balance, and a closing balance; the administrator trial balance reads through the same checkpoints. Reconciliation re-checks every checkpoint against the entries.
 - **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
 - **Idempotency keys, scoped per user.** Every deposit, withdrawal, transfer and hold takes an `Idempotency-Key` header (or the `requestKey` body field). The first response, success or business error, is stored and replayed byte-for-byte for retries, marked `Idempotent-Replayed: true`, even when many retries arrive at once. Reusing a key for a different request returns 422. Keys are scoped to the calling user and expire after 24 hours. Posting stays exactly-once even if the server stops between posting and storing the response.
 - **Short, deadlock-free locking.** A transfer writes its transaction and ledger entries first, then updates both balances last with atomic statements in UUID order (the debit only succeeds if available funds cover it). Account locks are held only for those final statements and the commit, and opposing transfers (A→B and B→A) cannot deadlock.
@@ -45,6 +46,7 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | Webhook hardening tests | 33 SSRF URL cases; internal URLs refused at registration; a host that now resolves internally gets no request; secrets stored only encrypted and bound to their endpoint; old plain-text secrets migrated; rotation signs with both secrets during the overlap; dead-lettered deliveries resent |
 | Webhook tests (real HTTP receiver) | Events only for committed changes; routing to payer and payee only; signatures verify and reject tampering; retries on schedule; dead-lettering; timeouts; expired leases; 6 concurrent workers deliver 120 events exactly once |
 | Hold API tests (real JWT security) | Only the payer can place a hold, only the payee can post or void it, only the two parties can see it |
+| Checkpoint tests | Balances at many moments, through checkpoints, equal a full scan of the entries; the trial balance through checkpoints matches the entries; the job checkpoints each boundary once and only past the horizon; an entry committed after its checkpoint is reported; an altered checkpoint is reported; statements show opening, lines with running balance and closing, and are owner-only; database transactions are time-limited |
 | Hash-chain tests | Every committed transaction sealed once into one chain; a balanced change invisible to reconciliation (transaction, entries and balances all altered consistently) caught by the chain; changed details and deleted transactions caught; re-sealing a tampered seal breaks the next link, and a full rewrite is caught against an externally recorded head; concurrent sealers never fork the chain; initiators recorded and visible to administrators |
 | Chart of accounts tests | Every customer account gets its own liability account; each posting type produces the right debits and credits; the trial balance balances and satisfies the accounting equation, now and as of an earlier moment; fees need funds and are idempotent; the ledger API is admin-only; the database rejects an account whose normal side contradicts its type; reconciliation notices an entry with no chart account |
 | Ledger tests | Each operation posts the right balanced entries; unbalanced postings, transactions without entries, and edits or deletes of history are rejected by PostgreSQL; reconciliation detects a balance changed outside the ledger |
@@ -105,6 +107,13 @@ seal 3: SHA-256(hash of seal 2, 3, transactions sealed in 3) ─┘  ledger entr
 - Sealing runs after commit and in the background, so posting never waits on a single chain head; a PostgreSQL advisory lock keeps concurrent sealers from forking the chain. Transactions committed since the last seal (a few seconds' worth) are not yet covered.
 - Every transaction records `initiated_by`, the user whose request created it (null for the system, such as the hold expiry job). Batched postings capture it on the request's thread, since batch workers have no login of their own.
 
+## How balance checkpoints work
+
+- Once a day (UTC), every ledger account that had activity gets a checkpoint: its cumulative debits and credits for all entries dated before midnight. A balance at any moment, for a statement or a trial balance, is the latest checkpoint before that moment plus the entries since.
+- **Timing is the hard part.** An entry's time is set before its transaction commits, so a checkpoint taken too early could miss a transaction that commits afterwards, and checkpoints are append-only. So a boundary is checkpointed only once it is at least 10 minutes old, and every database transaction is limited to 2 minutes (`transaction_timeout`, which needs PostgreSQL 17 or later). Reconciliation also re-checks every checkpoint as the previous one plus the entries between them, so a checkpoint that ever missed an entry would be reported.
+- Statements read from the customer's side: money in is positive, money out negative. They add up by construction and are checked: the opening balance plus every line equals the closing balance.
+- Settings: `smartbank.ledger.checkpoint-period` (`P1D`), `checkpoint-horizon` (`PT10M`), `checkpoint-interval` (`PT15M`).
+
 ## How holds work
 
 ```
@@ -153,7 +162,7 @@ Java 21, Spring Boot 3.5, Spring Data JPA, Spring Security (OAuth2 resource serv
 
 ## Run it locally
 
-Requirements: Docker. Node.js 20.19+ for the frontend. JDK 21 and Maven are optional; tests can run in Docker.
+Requirements: Docker. The backend needs PostgreSQL 17 or later (Docker Compose provides it). Node.js 20.19+ for the frontend. JDK 21 and Maven are optional; tests can run in Docker.
 
 Start PostgreSQL and the API (API on `http://localhost:8081`):
 
@@ -217,6 +226,7 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `GET` | `/api/v1/holds/{id}` | Payer or payee only |
 | `POST` | `/api/v1/holds/{id}/post` | Optional `{ "amount" }` for a partial post. Payee only |
 | `POST` | `/api/v1/holds/{id}/void` | Payee only |
+| `GET` | `/api/v1/accounts/{id}/statement` | `?from=&to=` (ISO times, default the last 30 days, at most 366): opening balance, postings with running balance, closing balance. Owner only |
 | `GET` | `/api/v1/accounts/{id}/holds` | Holds in or out of the account, newest 100, owner only |
 | `POST` | `/api/v1/webhook-endpoints` | `{ "url", "eventTypes"? }`. Returns the signing secret once |
 | `GET` | `/api/v1/webhook-endpoints` | The caller's endpoints |
@@ -252,7 +262,7 @@ Sending the same command again with the same `$KEY` returns the identical respon
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/ratelimit`: token-bucket limiter, limits, filter
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator, V14 balance checkpoints)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
