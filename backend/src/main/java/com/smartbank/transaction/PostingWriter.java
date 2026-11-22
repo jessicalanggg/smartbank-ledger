@@ -64,10 +64,11 @@ public class PostingWriter {
         List<String> txValues = new ArrayList<>(), entryValues = new ArrayList<>(),
                 eventValues = new ArrayList<>(), fanOutValues = new ArrayList<>();
         for (BankingTransaction tx : txs) {
-            txValues.add("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            txValues.add("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             params.addAll(Arrays.asList(tx.getId(), tx.getTransactionType().name(), tx.getSourceAccountId(),
                     tx.getDestinationAccountId(), tx.getAmount(), tx.getCurrency(), tx.getRequestKey(),
-                    Timestamp.from(tx.getCreatedAt()), tx.getLinkId(), tx.getLinkIndex(), tx.getReversesTransactionId()));
+                    Timestamp.from(tx.getCreatedAt()), tx.getLinkId(), tx.getLinkIndex(), tx.getReversesTransactionId(),
+                    tx.getInitiatedBy()));
         }
         for (BankingTransaction tx : txs) {
             for (LedgerEntry e : BankingService.postings(tx)) {
@@ -93,7 +94,8 @@ public class PostingWriter {
         jdbc.update("""
                 WITH tx AS (
                     INSERT INTO banking_transactions (id, transaction_type, source_account_id, destination_account_id,
-                        amount, currency, request_key, created_at, link_id, link_index, reverses_transaction_id)
+                        amount, currency, request_key, created_at, link_id, link_index, reverses_transaction_id,
+                        initiated_by)
                     VALUES %s),
                 entries AS (
                     INSERT INTO ledger_entries (id, transaction_id, ledger_account, account_id, amount, currency, created_at)

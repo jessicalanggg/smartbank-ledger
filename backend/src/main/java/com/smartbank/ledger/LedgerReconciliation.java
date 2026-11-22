@@ -12,30 +12,39 @@ import java.math.BigDecimal;
  * amounts equal the open holds, every posted hold matches its transfer, and the
  * outbox holds exactly one event per posted transaction and per hold state, debits
  * equal credits within each currency, and every entry lands on exactly one account
- * in the chart of accounts.
+ * in the chart of accounts, and the hash chain of seals is intact.
  * Runs in one REPEATABLE READ snapshot so concurrent postings cannot make a
  * consistent ledger look inconsistent.
  */
 @Service
 public class LedgerReconciliation {
     private final JdbcTemplate jdbc;
+    private final LedgerSealer sealer;
 
-    public LedgerReconciliation(JdbcTemplate jdbc) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public LedgerReconciliation(JdbcTemplate jdbc, LedgerSealer sealer) {
         this.jdbc = jdbc;
+        this.sealer = sealer;
+    }
+
+    /** Outside Spring (for example in migration tests): verification needs only the database. */
+    public LedgerReconciliation(JdbcTemplate jdbc) {
+        this(jdbc, new LedgerSealer(jdbc, null, java.time.Clock.systemUTC()));
     }
 
     public record Report(BigDecimal ledgerTotal, int unbalancedTransactions,
                          int transactionsWithoutEntries, int accountsOutOfBalance,
                          int accountsWithWrongPendingAmounts, int postedHoldsNotMatchingTransfer,
                          int transactionsWithoutExactlyOneEvent, int holdsWithWrongEvents,
-                         int currenciesOutOfBalance, int entriesWithoutChartAccount, int customerAccountsWithoutChartAccount) {
+                         int currenciesOutOfBalance, int entriesWithoutChartAccount, int customerAccountsWithoutChartAccount,
+                         int brokenSeals) {
         public boolean isClean() {
             return ledgerTotal.signum() == 0 && unbalancedTransactions == 0
                     && transactionsWithoutEntries == 0 && accountsOutOfBalance == 0
                     && accountsWithWrongPendingAmounts == 0 && postedHoldsNotMatchingTransfer == 0
                     && transactionsWithoutExactlyOneEvent == 0 && holdsWithWrongEvents == 0
                     && currenciesOutOfBalance == 0 && entriesWithoutChartAccount == 0
-                    && customerAccountsWithoutChartAccount == 0;
+                    && customerAccountsWithoutChartAccount == 0 && brokenSeals == 0;
         }
     }
 
@@ -99,7 +108,9 @@ public class LedgerReconciliation {
         Integer customersWithoutChart = jdbc.queryForObject("""
                 SELECT COUNT(*) FROM accounts a
                 WHERE NOT EXISTS (SELECT 1 FROM ledger_accounts la WHERE la.customer_account_id = a.id)""", Integer.class);
+        // The hash chain over sealed transactions is intact.
+        int brokenSeals = sealer.verify().intact() ? 0 : 1;
         return new Report(total, unbalanced, withoutEntries, outOfBalance, wrongPending, badPostings,
-                missingEvents, holdEvents, currencies, unmapped, customersWithoutChart);
+                missingEvents, holdEvents, currencies, unmapped, customersWithoutChart, brokenSeals);
     }
 }

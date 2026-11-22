@@ -23,6 +23,8 @@ public class BankingTransaction {
     @Column(name = "link_index", updatable = false) private Short linkIndex;
     /** Set for reversals: the transaction this one (partly) undoes. */
     @Column(name = "reverses_transaction_id", updatable = false) private UUID reversesTransactionId;
+    /** The user whose request created this transaction; null for the system. */
+    @Column(name = "initiated_by", updatable = false) private UUID initiatedBy;
 
     protected BankingTransaction() { }
     public BankingTransaction(TransactionType type, UUID source, UUID destination,
@@ -64,6 +66,13 @@ public class BankingTransaction {
     }
 
     public UUID getReversesTransactionId() { return reversesTransactionId; }
+    public UUID getInitiatedBy() { return initiatedBy; }
+
+    /** Records who started the transaction; set before it is written. */
+    BankingTransaction initiatedBy(UUID user) {
+        this.initiatedBy = user;
+        return this;
+    }
     public UUID getLinkId() { return linkId; }
     public Integer getLinkIndex() { return linkIndex == null ? null : linkIndex.intValue(); }
 }

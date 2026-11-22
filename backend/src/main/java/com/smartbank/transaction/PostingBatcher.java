@@ -3,6 +3,7 @@ package com.smartbank.transaction;
 import com.smartbank.account.Account;
 import com.smartbank.account.AccountNotFoundException;
 import com.smartbank.account.AccountRepository;
+import com.smartbank.common.Initiator;
 import com.smartbank.common.UuidOrder;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -61,18 +62,21 @@ public class PostingBatcher {
      * transfer (legs set, all posting together or not at all), with its request key.
      */
     record Posting(TransactionType type, UUID from, UUID to, BigDecimal amount, String key,
-                   List<LinkedTransferRequest.Leg> legs) {
+                   List<LinkedTransferRequest.Leg> legs, UUID initiatedBy) {
+        // The initiator is read here, on the caller's thread: batch workers have no security context.
         static Posting transfer(TransferRequest r) {
-            return new Posting(TransactionType.TRANSFER, r.fromAccountId(), r.toAccountId(), r.amount(), r.requestKey(), null);
+            return new Posting(TransactionType.TRANSFER, r.fromAccountId(), r.toAccountId(), r.amount(), r.requestKey(), null,
+                    Initiator.current());
         }
         static Posting deposit(UUID account, MoneyRequest r) {
-            return new Posting(TransactionType.DEPOSIT, null, account, r.amount(), r.requestKey(), null);
+            return new Posting(TransactionType.DEPOSIT, null, account, r.amount(), r.requestKey(), null, Initiator.current());
         }
         static Posting withdrawal(UUID account, MoneyRequest r) {
-            return new Posting(TransactionType.WITHDRAWAL, account, null, r.amount(), r.requestKey(), null);
+            return new Posting(TransactionType.WITHDRAWAL, account, null, r.amount(), r.requestKey(), null, Initiator.current());
         }
         static Posting linked(LinkedTransferRequest r) {
-            return new Posting(TransactionType.TRANSFER, null, null, null, r.requestKey(), List.copyOf(r.transfers()));
+            return new Posting(TransactionType.TRANSFER, null, null, null, r.requestKey(), List.copyOf(r.transfers()),
+                    Initiator.current());
         }
         boolean isLinked() { return legs != null; }
         /** The account a single-account posting is about. */
@@ -292,7 +296,7 @@ public class PostingBatcher {
                     net.merge(leg.fromAccountId(), leg.amount().negate(), BigDecimal::add);
                     net.merge(leg.toAccountId(), leg.amount(), BigDecimal::add);
                     rows.add(BankingTransaction.linkedLeg(linkId, i, leg.fromAccountId(), leg.toAccountId(), leg.amount(),
-                            locked.get(leg.fromAccountId()).getCurrency(), r.key()));
+                            locked.get(leg.fromAccountId()).getCurrency(), r.key()).initiatedBy(r.initiatedBy()));
                 }
                 linkIds.put(p, linkId);
                 accepted.add(p);
@@ -313,7 +317,8 @@ public class PostingBatcher {
                 net.merge(r.to(), r.amount(), BigDecimal::add);
             }
             String currency = locked.get(r.from() != null ? r.from() : r.to()).getCurrency();
-            rows.add(new BankingTransaction(r.type(), r.from(), r.to(), r.amount(), currency, r.key()));
+            rows.add(new BankingTransaction(r.type(), r.from(), r.to(), r.amount(), currency, r.key())
+                    .initiatedBy(r.initiatedBy()));
             accepted.add(p);
             acceptedByKey.put(r.key(), p);
         }

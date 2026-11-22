@@ -33,7 +33,8 @@ public final class LedgerTestData {
      * TRUNCATE bypasses the append-only and hold-transition triggers.
      */
     public static void truncateLedger(JdbcTemplate jdbc) {
-        jdbc.execute("TRUNCATE webhook_deliveries, outbox_events, holds, ledger_entries, banking_transactions");
+        jdbc.execute("TRUNCATE ledger_sealed_transactions, ledger_seals, webhook_deliveries, outbox_events, holds, "
+                + "ledger_entries, banking_transactions");
         jdbc.update("UPDATE accounts SET pending_debits = 0, pending_credits = 0");
     }
 

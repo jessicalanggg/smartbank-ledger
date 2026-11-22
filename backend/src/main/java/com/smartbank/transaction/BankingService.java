@@ -1,6 +1,7 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.*;
+import com.smartbank.common.Initiator;
 import com.smartbank.common.UuidOrder;
 import com.smartbank.ledger.LedgerAccount;
 import com.smartbank.ledger.LedgerEntry;
@@ -203,7 +204,7 @@ public class BankingService {
             net.merge(leg.fromAccountId(), leg.amount().negate(), BigDecimal::add);
             net.merge(leg.toAccountId(), leg.amount(), BigDecimal::add);
             rows.add(BankingTransaction.linkedLeg(linkId, i, leg.fromAccountId(), leg.toAccountId(),
-                    leg.amount(), source.getCurrency(), key));
+                    leg.amount(), source.getCurrency(), key).initiatedBy(Initiator.current()));
         }
         for (var change : net.entrySet())
             if (change.getValue().signum() < 0
@@ -273,7 +274,7 @@ public class BankingService {
         if (amount.compareTo(remaining) > 0)
             throw new BankingException("Cannot reverse more than the remaining " + remaining.toPlainString());
 
-        BankingTransaction reversal = BankingTransaction.reversalOf(original, amount, key);
+        BankingTransaction reversal = BankingTransaction.reversalOf(original, amount, key).initiatedBy(Initiator.current());
         UUID from = reversal.getSourceAccountId(), to = reversal.getDestinationAccountId();
         if (from != null)
             failFastIfUnavailable(accounts.findById(from).orElseThrow(() -> new AccountNotFoundException(from)), amount);
@@ -407,7 +408,7 @@ public class BankingService {
      */
     TransactionResponse record(TransactionType type, UUID from, UUID to,
             BigDecimal amount, String currency, String key) {
-        return writer.post(new BankingTransaction(type, from, to, amount, currency, key));
+        return writer.post(new BankingTransaction(type, from, to, amount, currency, key).initiatedBy(Initiator.current()));
     }
 
     /** The double-entry postings for a transaction; their amounts sum to zero. */
