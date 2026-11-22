@@ -7,7 +7,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 ## What it does
 
 - **Accounts, deposits, withdrawals and transfers** through a versioned REST API (`/api/v1`), with transaction history per account.
-- **Double-entry ledger.** Every transaction posts balanced, append-only ledger entries: a transfer debits one customer account and credits another; a deposit or withdrawal posts against an `EXTERNAL_CLEARING` account. PostgreSQL rejects at commit any transaction whose entries do not sum to zero, and rejects any `UPDATE` or `DELETE` of entries or transactions. A reconciliation check proves every cached account balance equals the sum of its entries.
+- **Double-entry ledger with a chart of accounts.** Every transaction posts balanced, append-only debit and credit lines to typed accounts (assets, liabilities, equity, revenue), each customer account being its own liability account; fees post to fee revenue. An administrator trial balance, as of any moment, checks debits = credits and Assets = Liabilities + Equity + Revenue − Expenses. PostgreSQL rejects at commit any transaction whose entries do not sum to zero, and rejects any `UPDATE` or `DELETE` of entries or transactions. A reconciliation check proves every cached account balance equals the sum of its entries.
 - **Two-phase transfers (holds).** A payer places a hold that reserves money without moving it, the way a card authorization does. The payee then posts it (in full or in part, releasing the rest) or voids it, and unposted holds expire automatically. Each account reports a posted balance, an available balance and pending amounts, and PostgreSQL rejects any change that would make the available balance negative.
 - **Transactional outbox and signed webhooks.** Every posting and hold change writes an event in the same database transaction, so an event exists if and only if its change committed. A worker delivers events to subscribed endpoints with HMAC-SHA256 signatures, at least once, with exponential backoff, a dead-letter state, and `SKIP LOCKED` leases so several instances can deliver safely. Webhook URLs are checked against SSRF (no internal or private addresses) at registration and before every delivery; signing secrets are encrypted at rest and can be rotated with an overlap; dead-lettered deliveries can be resent. See [docs/webhooks.md](docs/webhooks.md).
 - **Linked transfers.** Up to 20 transfers that post together or not at all, such as "charge the customer, pay the merchant, take a fee". Funds are checked on each account's net change across the group, every leg gets its own ledger entries and event tagged with the group's `linkId`, and the whole group is written in one SQL statement.
@@ -44,8 +44,9 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | Webhook hardening tests | 33 SSRF URL cases; internal URLs refused at registration; a host that now resolves internally gets no request; secrets stored only encrypted and bound to their endpoint; old plain-text secrets migrated; rotation signs with both secrets during the overlap; dead-lettered deliveries resent |
 | Webhook tests (real HTTP receiver) | Events only for committed changes; routing to payer and payee only; signatures verify and reject tampering; retries on schedule; dead-lettering; timeouts; expired leases; 6 concurrent workers deliver 120 events exactly once |
 | Hold API tests (real JWT security) | Only the payer can place a hold, only the payee can post or void it, only the two parties can see it |
+| Chart of accounts tests | Every customer account gets its own liability account; each posting type produces the right debits and credits; the trial balance balances and satisfies the accounting equation, now and as of an earlier moment; fees need funds and are idempotent; the ledger API is admin-only; the database rejects an account whose normal side contradicts its type; reconciliation notices an entry with no chart account |
 | Ledger tests | Each operation posts the right balanced entries; unbalanced postings, transactions without entries, and edits or deletes of history are rejected by PostgreSQL; reconciliation detects a balance changed outside the ledger |
-| Model-based randomized test | 4,800 random operations per run (transfers, linked transfers, reversals, retries, key conflicts, holds, posts, voids, expiry) match an independent model after every step; failures shrink to a minimal reproduction with a seed |
+| Model-based randomized test | 4,800 random operations per run (transfers, linked transfers, fees, reversals, retries, key conflicts, holds, posts, voids, expiry) match an independent model after every step; failures shrink to a minimal reproduction with a seed |
 | Network fault injection (Toxiproxy) | Connections cut 8 times under load; clients retry with the same key; every acknowledged transfer exists exactly once, lost acknowledgements are replayed, books reconcile |
 | Database crash injection | PostgreSQL killed with `SIGKILL` twice under load and recovered from its WAL; every acknowledged transfer survives, nothing posts twice, books reconcile |
 | Migration test | Upgrading a database with pre-ledger history backfills entries and opening balances that reconcile exactly |
@@ -59,15 +60,30 @@ See [`ConcurrencyIntegrationTest`](backend/src/test/java/com/smartbank/transacti
 
 ## How the ledger works
 
-| Transaction | Entries (signed; positive increases the ledger account) |
+Every transaction posts journal lines whose debits equal its credits. Lines post to a **chart of accounts**:
+
+| Code | Account | Type | Normal balance |
+| --- | --- | --- | --- |
+| 1000 | Cash and settlement | Asset | Debit |
+| 2000 | Customer deposits (control account) | Liability | Credit |
+| 2000-*number* | One per customer account, under 2000 | Liability | Credit |
+| 3900 | Opening balance equity | Equity | Credit |
+| 4000 | Fee revenue | Revenue | Credit |
+
+A customer's money is a liability of the bank (the bank owes it to them), so a credit increases it and a debit reduces it. Each currency has its own set of system accounts, and every new customer account gets its own ledger account automatically.
+
+| Transaction | Journal lines |
 | --- | --- |
-| Deposit 100 | `CUSTOMER(account) +100`, `EXTERNAL_CLEARING -100` |
-| Withdrawal 100 | `CUSTOMER(account) -100`, `EXTERNAL_CLEARING +100` |
-| Transfer 100 | `CUSTOMER(from) -100`, `CUSTOMER(to) +100` |
-| Opening balance 100 | `CUSTOMER(account) +100`, `OPENING_EQUITY -100` |
-| Hold posted for 60 of 100 | Same as a transfer of 60; the hold itself posts no entries |
-| Reversal of 30 of a transfer A→B | `CUSTOMER(B) -30`, `CUSTOMER(A) +30` |
-| Reversal of a deposit of 100 | `CUSTOMER(account) -100`, `EXTERNAL_CLEARING +100` |
+| Deposit 100 | DR 1000 Cash 100 · CR customer 100 |
+| Withdrawal 100 | DR customer 100 · CR 1000 Cash 100 |
+| Transfer 100, A→B | DR A 100 · CR B 100 |
+| Fee 2.50 | DR customer 2.50 · CR 4000 Fee revenue 2.50 |
+| Hold posted for 60 of 100 | Same as a transfer of 60; the hold itself posts nothing |
+| Reversal of 30 of a transfer A→B | DR B 30 · CR A 30 |
+| Reversal of a deposit of 100 | DR customer 100 · CR 1000 Cash 100 |
+| Opening balance 100 | DR 3900 Opening balance equity 100 · CR customer 100 |
+
+Entries are stored with signed amounts (positive = credit, negative = debit); the `journal_lines` view shows each entry as a debit or credit line on its chart account. Administrators get a **trial balance** per currency, optionally as of any past moment, which checks that total debits equal total credits and that **Assets = Liabilities + Equity + Revenue − Expenses**, with the customer control account rolling up every customer's balance.
 
 `accounts.balance` is kept as a cached balance, because transfers lock the account row and check funds against it. The ledger is the record it must agree with, which [`LedgerReconciliation`](backend/src/main/java/com/smartbank/ledger/LedgerReconciliation.java) verifies. Balances that existed before the ledger (migration `V4`) were posted as opening balances dated before each account's first transaction.
 
@@ -170,6 +186,10 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `POST` | `/api/v1/accounts/{id}/withdrawals` | `{ "amount": "25.00" }` |
 | `POST` | `/api/v1/transfers` | `{ "fromAccountId", "toAccountId", "amount" }`. Caller must own the source |
 | `POST` | `/api/v1/transfers/by-account-number` | `{ "fromAccountId", "toAccountNumber", "amount" }` |
+| `POST` | `/api/v1/accounts/{id}/fees` | `{ "amount" }`. Charges a fee, credited to fee revenue. Admin only |
+| `GET` | `/api/v1/ledger/accounts` | Chart of accounts with balances; `?currency=`, `?asOf=`. Admin only |
+| `GET` | `/api/v1/ledger/trial-balance` | Debits, credits, balances by type, and the accounting-equation check; `?currency=`, `?asOf=`. Admin only |
+| `GET` | `/api/v1/ledger/transactions/{id}/journal` | A transaction's debit and credit lines. Admin only |
 | `POST` | `/api/v1/transactions/{id}/reversals` | Optional `{ "amount" }`; without it, whatever is not yet reversed. Transfers: payee or admin. Deposits and withdrawals: admin |
 | `POST` | `/api/v1/transfers/linked` | `{ "transfers": [ { "fromAccountId", "toAccountId", "amount" }, … ] }`, 1–20 legs, all or nothing. Caller must own every source |
 | `GET` | `/api/v1/accounts/{id}/transactions` | Newest 100, owner only |
@@ -208,12 +228,12 @@ Sending the same command again with the same `$KEY` returns the identical respon
 
 - `backend/src/main/java/com/smartbank/account`: accounts API, entity and locking repository
 - `backend/src/main/java/com/smartbank/transaction`: deposits, withdrawals, transfers, holds, idempotency
-- `backend/src/main/java/com/smartbank/ledger`: ledger entries, posting accounts, reconciliation
+- `backend/src/main/java/com/smartbank/ledger`: ledger entries, chart of accounts, trial balance, reconciliation
 - `backend/src/main/java/com/smartbank/events`: outbox, webhook endpoints, signed delivery worker
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/ratelimit`: token-bucket limiter, limits, filter
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
