@@ -106,3 +106,40 @@ export function postHold(token: string, holdId: string, amount?: number) {
 export function voidHold(token: string, holdId: string) {
   return request<Hold>(`/holds/${encodeURIComponent(holdId)}/void`, token, { method: 'POST' });
 }
+
+// Agent spending mandates: an AI agent pays from one account within limits the bank enforces.
+export type MandateStatus = 'ACTIVE' | 'REVOKED' | 'EXPIRED';
+export type Mandate = {
+  id: string; name: string; accountId: string; currency: string;
+  perPaymentLimit: number; dailyLimit: number; spentToday: number; remainingToday: number;
+  askAboveLimit: boolean; allowedPayees: string[]; keyPrefix: string; status: MandateStatus;
+  createdAt: string; expiresAt: string; revokedAt?: string;
+};
+export type AgentPaymentStatus = 'POSTED' | 'PENDING_APPROVAL' | 'APPROVED' | 'DECLINED' | 'EXPIRED' | 'REJECTED';
+export type AgentPayment = {
+  id: string; mandateId: string; status: AgentPaymentStatus; reason?: string; payeeAccountNumber: string;
+  amount: number; currency: string; intent: string; transactionId?: string; holdId?: string;
+  approvalExpiresAt?: string; createdAt: string; decidedAt?: string;
+};
+export type NewMandate = {
+  accountId: string; name: string; perPaymentLimit: string; dailyLimit: string;
+  allowedPayeeAccountNumbers: string[]; expiresInDays: number; askAboveLimit: boolean;
+};
+export function mandates(token: string) { return request<Mandate[]>('/mandates', token); }
+/** The response holds the agent's API key; this is the only time it is shown. */
+export function createMandate(token: string, mandate: NewMandate) {
+  return request<{ mandate: Mandate; apiKey: string }>('/mandates', token, { method: 'POST', body: JSON.stringify(mandate) });
+}
+export function revokeMandate(token: string, id: string) {
+  return request<Mandate>(`/mandates/${encodeURIComponent(id)}/revoke`, token, { method: 'POST' });
+}
+export function mandatePayments(token: string, id: string) {
+  return request<AgentPayment[]>(`/mandates/${encodeURIComponent(id)}/payments`, token);
+}
+export function awaitingApproval(token: string) { return request<AgentPayment[]>('/agent-payments/awaiting-approval', token); }
+export function approveAgentPayment(token: string, id: string) {
+  return request<AgentPayment>(`/agent-payments/${encodeURIComponent(id)}/approve`, token, { method: 'POST' });
+}
+export function declineAgentPayment(token: string, id: string) {
+  return request<AgentPayment>(`/agent-payments/${encodeURIComponent(id)}/decline`, token, { method: 'POST' });
+}
