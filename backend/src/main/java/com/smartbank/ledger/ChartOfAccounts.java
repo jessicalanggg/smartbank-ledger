@@ -40,17 +40,28 @@ public class ChartOfAccounts {
 
     public record JournalLine(String code, String name, String type, BigDecimal debit, BigDecimal credit, String currency) { }
 
-    /** Every account of the currency with its balance; control accounts roll up their sub-accounts. */
+    /**
+     * Every account of the currency with its balance from entries dated before
+     * {@code asOf} (now if null), each read as its latest checkpoint plus the entries
+     * since. Control accounts roll up their sub-accounts.
+     */
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public List<AccountBalance> accounts(String currency, Instant asOf) {
+        Timestamp at = Timestamp.from(asOf == null ? Instant.now() : asOf);
         List<AccountBalance> rows = jdbc.query("""
                 SELECT la.id, la.code, la.name, la.account_type, la.normal_balance, la.currency, la.parent_id,
                        la.customer_account_id,
-                       COALESCE(SUM(j.debit), 0) AS debits, COALESCE(SUM(j.credit), 0) AS credits
+                       COALESCE(cp.debits, 0) + COALESCE(d.debits, 0) AS debits,
+                       COALESCE(cp.credits, 0) + COALESCE(d.credits, 0) AS credits
                 FROM ledger_accounts la
-                LEFT JOIN journal_lines j ON j.ledger_account_id = la.id AND (?::timestamptz IS NULL OR j.created_at <= ?::timestamptz)
+                LEFT JOIN LATERAL (
+                    SELECT c.debits, c.credits, c.as_of FROM ledger_checkpoints c
+                    WHERE c.ledger_account_id = la.id AND c.as_of <= ? ORDER BY c.as_of DESC LIMIT 1) cp ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT SUM(j.debit) AS debits, SUM(j.credit) AS credits FROM journal_lines j
+                    WHERE j.ledger_account_id = la.id AND j.created_at >= COALESCE(cp.as_of, '-infinity')
+                      AND j.created_at < ?) d ON TRUE
                 WHERE la.currency = ?
-                GROUP BY la.id
                 ORDER BY la.code""",
                 (rs, n) -> {
                     BigDecimal debits = rs.getBigDecimal("debits"), credits = rs.getBigDecimal("credits");
@@ -60,7 +71,7 @@ public class ChartOfAccounts {
                             rs.getObject("parent_id", UUID.class), rs.getObject("customer_account_id", UUID.class),
                             debits, credits, normalSide(normal, debits, credits));
                 },
-                ts(asOf), ts(asOf), currency);
+                at, at, currency);
         // Control accounts (no postings of their own) show the total of their sub-accounts.
         Map<UUID, BigDecimal[]> rollup = new HashMap<>();
         for (AccountBalance a : rows)
@@ -111,7 +122,4 @@ public class ChartOfAccounts {
         return "DEBIT".equals(normal) ? debits.subtract(credits) : credits.subtract(debits);
     }
 
-    private static Timestamp ts(Instant instant) {
-        return instant == null ? null : Timestamp.from(instant);
-    }
 }

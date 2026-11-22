@@ -12,7 +12,8 @@ import java.math.BigDecimal;
  * amounts equal the open holds, every posted hold matches its transfer, and the
  * outbox holds exactly one event per posted transaction and per hold state, debits
  * equal credits within each currency, and every entry lands on exactly one account
- * in the chart of accounts, and the hash chain of seals is intact.
+ * in the chart of accounts, the hash chain of seals is intact, and every balance
+ * checkpoint matches the entries before it.
  * Runs in one REPEATABLE READ snapshot so concurrent postings cannot make a
  * consistent ledger look inconsistent.
  */
@@ -37,14 +38,14 @@ public class LedgerReconciliation {
                          int accountsWithWrongPendingAmounts, int postedHoldsNotMatchingTransfer,
                          int transactionsWithoutExactlyOneEvent, int holdsWithWrongEvents,
                          int currenciesOutOfBalance, int entriesWithoutChartAccount, int customerAccountsWithoutChartAccount,
-                         int brokenSeals) {
+                         int brokenSeals, int inconsistentCheckpoints) {
         public boolean isClean() {
             return ledgerTotal.signum() == 0 && unbalancedTransactions == 0
                     && transactionsWithoutEntries == 0 && accountsOutOfBalance == 0
                     && accountsWithWrongPendingAmounts == 0 && postedHoldsNotMatchingTransfer == 0
                     && transactionsWithoutExactlyOneEvent == 0 && holdsWithWrongEvents == 0
                     && currenciesOutOfBalance == 0 && entriesWithoutChartAccount == 0
-                    && customerAccountsWithoutChartAccount == 0 && brokenSeals == 0;
+                    && customerAccountsWithoutChartAccount == 0 && brokenSeals == 0 && inconsistentCheckpoints == 0;
         }
     }
 
@@ -110,7 +111,23 @@ public class LedgerReconciliation {
                 WHERE NOT EXISTS (SELECT 1 FROM ledger_accounts la WHERE la.customer_account_id = a.id)""", Integer.class);
         // The hash chain over sealed transactions is intact.
         int brokenSeals = sealer.verify().intact() ? 0 : 1;
+        // Every balance checkpoint equals the previous one plus the entries between them,
+        // so a checkpoint that missed a late entry, or was altered, is reported.
+        Integer checkpoints = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM (
+                    SELECT c.ledger_account_id, c.as_of, c.debits, c.credits,
+                           LAG(c.debits) OVER w AS prev_debits, LAG(c.credits) OVER w AS prev_credits,
+                           LAG(c.as_of) OVER w AS prev_as_of
+                    FROM ledger_checkpoints c
+                    WINDOW w AS (PARTITION BY c.ledger_account_id ORDER BY c.as_of)) x
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(j.debit), 0) AS debits, COALESCE(SUM(j.credit), 0) AS credits
+                    FROM journal_lines j
+                    WHERE j.ledger_account_id = x.ledger_account_id
+                      AND j.created_at >= COALESCE(x.prev_as_of, '-infinity') AND j.created_at < x.as_of) d ON TRUE
+                WHERE COALESCE(x.prev_debits, 0) + d.debits <> x.debits
+                   OR COALESCE(x.prev_credits, 0) + d.credits <> x.credits""", Integer.class);
         return new Report(total, unbalanced, withoutEntries, outOfBalance, wrongPending, badPostings,
-                missingEvents, holdEvents, currencies, unmapped, customersWithoutChart, brokenSeals);
+                missingEvents, holdEvents, currencies, unmapped, customersWithoutChart, brokenSeals, checkpoints);
     }
 }

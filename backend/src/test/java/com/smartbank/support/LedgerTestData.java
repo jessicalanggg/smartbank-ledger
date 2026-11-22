@@ -6,7 +6,9 @@ import java.util.UUID;
 
 /**
  * Test data that respects the ledger: whenever a test sets up a balance, it also
- * posts a balanced OPENING_BALANCE transaction for it. Each posting is a single
+ * posts a balanced OPENING_BALANCE transaction for it, dated a second ago: before the
+ * test's own postings, and never before an existing balance checkpoint (those are at
+ * least the checkpoint horizon old), which reconciliation would report as a late entry. Each posting is a single
  * SQL statement, so the deferred balance check passes at its implicit commit.
  */
 public final class LedgerTestData {
@@ -19,13 +21,13 @@ public final class LedgerTestData {
             ), t AS (
                 INSERT INTO banking_transactions
                     (id, transaction_type, source_account_id, destination_account_id, amount, currency, request_key, created_at)
-                SELECT tx, 'OPENING_BALANCE', NULL, account_id, balance, currency, NULL, now() - INTERVAL '1 day' FROM o
+                SELECT tx, 'OPENING_BALANCE', NULL, account_id, balance, currency, NULL, now() - INTERVAL '1 second' FROM o
                 RETURNING id
             )
             INSERT INTO ledger_entries (id, transaction_id, ledger_account, account_id, amount, currency, created_at)
-            SELECT gen_random_uuid(), tx, 'CUSTOMER', account_id, balance, currency, now() - INTERVAL '1 day' FROM o
+            SELECT gen_random_uuid(), tx, 'CUSTOMER', account_id, balance, currency, now() - INTERVAL '1 second' FROM o
             UNION ALL
-            SELECT gen_random_uuid(), tx, 'OPENING_EQUITY', NULL, -balance, currency, now() - INTERVAL '1 day' FROM o""";
+            SELECT gen_random_uuid(), tx, 'OPENING_EQUITY', NULL, -balance, currency, now() - INTERVAL '1 second' FROM o""";
 
     /**
      * Empties outbox events and deliveries, holds, the ledger and the transaction
@@ -33,8 +35,8 @@ public final class LedgerTestData {
      * TRUNCATE bypasses the append-only and hold-transition triggers.
      */
     public static void truncateLedger(JdbcTemplate jdbc) {
-        jdbc.execute("TRUNCATE ledger_sealed_transactions, ledger_seals, webhook_deliveries, outbox_events, holds, "
-                + "ledger_entries, banking_transactions");
+        jdbc.execute("TRUNCATE ledger_checkpoints, ledger_checkpoint_runs, ledger_sealed_transactions, ledger_seals, "
+                + "webhook_deliveries, outbox_events, holds, ledger_entries, banking_transactions");
         jdbc.update("UPDATE accounts SET pending_debits = 0, pending_credits = 0");
     }
 
