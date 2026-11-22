@@ -21,7 +21,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Rate limiting.** Token buckets in PostgreSQL, shared by every app instance, each checked with one atomic statement. Failed logins are limited per email (a successful login gives its token back), and login, registration and unauthenticated requests per IP; authenticated requests per user, with a stricter limit for writes. Refused requests get 429 with `Retry-After`. Unknown emails take as long to reject as wrong passwords, so login timing does not reveal which accounts exist.
 - **Authentication and authorization.** Spring Security with stateless JWT (HS256, 30-minute expiry) and BCrypt password hashing. Users can only read, debit or view the history of accounts they own.
 - **Database-enforced invariants.** Flyway migrations define `CHECK (balance >= 0)`, positive amounts, valid transaction shapes, a `UNIQUE` request key, balanced ledger postings and append-only history, so the database rejects bad states even if application code is wrong.
-- **React frontend** with login, accounts, history, deposits, withdrawals and transfers by account number, including safe retry with the same request key.
+- **React frontend** with login, accounts (with available balance and pending amounts), history, deposits, withdrawals, transfers by account number, and holds: place a hold by account number, then capture incoming holds in full or in part, or release them. Every money-moving action retries safely with the same idempotency key.
 
 ## Verified by tests
 
@@ -174,6 +174,7 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `POST` | `/api/v1/transfers/linked` | `{ "transfers": [ { "fromAccountId", "toAccountId", "amount" }, … ] }`, 1–20 legs, all or nothing. Caller must own every source |
 | `GET` | `/api/v1/accounts/{id}/transactions` | Newest 100, owner only |
 | `POST` | `/api/v1/holds` | `{ "fromAccountId", "toAccountId", "amount", "expiresInSeconds"? }`. Caller must own the source |
+| `POST` | `/api/v1/holds/by-account-number` | `{ "fromAccountId", "toAccountNumber", "amount", "expiresInSeconds"? }` |
 | `GET` | `/api/v1/holds/{id}` | Payer or payee only |
 | `POST` | `/api/v1/holds/{id}/post` | Optional `{ "amount" }` for a partial post. Payee only |
 | `POST` | `/api/v1/holds/{id}/void` | Payee only |
@@ -224,6 +225,6 @@ Not implemented: refresh tokens or token revocation, MFA, account opening, audit
 Next steps:
 - Re-run the throughput benchmarks on a quiet machine.
 - Close the remaining DNS-rebinding window for webhooks with an egress proxy, and allow rotating the secret-encryption key.
-- Holds in the frontend (the API and tests are complete; the UI does not show holds yet).
+- Frontend navigation on phones (the sidebar is hidden below 520 px, leaving only the Overview page).
 
 Development history by sprint: [Sprint 2](SPRINT2_README.md) (transactions), [Sprint 3](SPRINT3_README.md) (authentication), [frontend](frontend/README.md).

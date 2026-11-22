@@ -8,7 +8,9 @@ import {
     ArrowUpRight,
     History,
     ShieldCheck,
+    Clock,
 } from "lucide-react";
+import Holds from "./Holds";
 import {
     accounts,
     deposit,
@@ -65,7 +67,7 @@ export default function App() {
     const [transferUncertain, setTransferUncertain] = useState(false);
     const transferInFlight = useRef(false);
     const pendingMoneyAction = useRef<{ action: string; accountId: string; amount: string; requestKey: string } | null>(null);
-    const [page, setPage] = useState<"overview" | "transactions">("overview");
+    const [page, setPage] = useState<"overview" | "transactions" | "holds">("overview");
     const [filter, setFilter] = useState("all");
     const [search, setSearch] = useState("");
     const active = items.find((a) => a.id === selected);
@@ -169,7 +171,7 @@ export default function App() {
             setError('Source and destination accounts must differ.');
             return;
         }
-        if (value > Number(active.balance)) {
+        if (value > Number(active.availableBalance ?? active.balance)) {
             setError('The amount exceeds your available balance.');
             return;
         }
@@ -288,6 +290,13 @@ export default function App() {
                 >
                     <History size={19} /> Transactions
                 </button>
+                <button
+                    type="button"
+                    className={`nav ${page === "holds" ? "active" : ""}`}
+                    onClick={() => setPage("holds")}
+                >
+                    <Clock size={19} /> Holds
+                </button>
                 <div className="side-bottom">
                     <span>Signed in as</span>
                     <strong>{email}</strong>
@@ -316,12 +325,16 @@ export default function App() {
                         <h1>
                             {page === "overview"
                                 ? "Your accounts"
-                                : "Transactions"}
+                                : page === "holds"
+                                    ? "Holds"
+                                    : "Transactions"}
                         </h1>
                         <p>
                             {page === "overview"
                                 ? "Welcome to your SmartBank dashboard."
-                                : "Review activity for your selected account."}
+                                : page === "holds"
+                                    ? "Reserve money now, settle it later."
+                                    : "Review activity for your selected account."}
                         </p>
                     </div>
                     <button
@@ -346,7 +359,7 @@ export default function App() {
                             <div className="big-balance">
                                 {money(
                                     items.reduce(
-                                        (s, a) => s + Number(a.balance),
+                                        (s, a) => s + Number(a.availableBalance ?? a.balance),
                                         0,
                                     ),
                                     "CAD",
@@ -370,9 +383,16 @@ export default function App() {
                                         <Wallet size={21} />
                                     </div>
                                     <strong>
-                                        {money(Number(a.balance), a.currency)}
+                                        {money(Number(a.availableBalance ?? a.balance), a.currency)}
                                     </strong>
                                     <span>{a.accountNumber}</span>
+                                    {(Number(a.pendingDebits) > 0 || Number(a.pendingCredits) > 0) && (
+                                        <small className="pending-line">
+                                            {Number(a.pendingDebits) > 0 && `${money(Number(a.pendingDebits), a.currency)} reserved by holds`}
+                                            {Number(a.pendingDebits) > 0 && Number(a.pendingCredits) > 0 && " · "}
+                                            {Number(a.pendingCredits) > 0 && `${money(Number(a.pendingCredits), a.currency)} incoming`}
+                                        </small>
+                                    )}
                                     <small>{a.ownerName}</small>
                                 </button>
                             ))}
@@ -545,6 +565,15 @@ export default function App() {
                             </section>
                         )}
                     </>
+                )}
+                {page === "holds" && (
+                    <Holds
+                        token={token}
+                        accounts={items}
+                        selected={selected}
+                        onSelect={setSelected}
+                        onChanged={() => load(token)}
+                    />
                 )}
                 {page === "transactions" && (
                     <section className="panel history-page">

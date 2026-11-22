@@ -1,4 +1,14 @@
-export type Account = { id: string; accountNumber: string; ownerName: string; accountType: string; balance: number; currency: string };
+/** balance is posted money; availableBalance subtracts outgoing holds; pendingCredits is money held for this account by others. */
+export type Account = {
+  id: string; accountNumber: string; ownerName: string; accountType: string; currency: string;
+  balance: number; availableBalance: number; pendingDebits: number; pendingCredits: number;
+};
+export type HoldStatus = 'PENDING' | 'POSTED' | 'VOIDED' | 'EXPIRED';
+export type Hold = {
+  id: string; fromAccountId: string; toAccountId: string; amount: number; currency: string; status: HoldStatus;
+  postedAmount: number | null; postedTransactionId: string | null;
+  createdAt: string; expiresAt: string; resolvedAt: string | null;
+};
 export type Transaction = Record<string, unknown>;
 export type LoginResponse = { accessToken: string; tokenType: string; expiresIn: number };
 const base = '/api/v1';
@@ -70,4 +80,29 @@ export interface TransferReceipt {
   amount: number;
   currency: string;
   createdAt: string;
+}
+
+// Two-phase transfers (holds)
+export function holdsForAccount(token: string, accountId: string) {
+  return request<Hold[]>(`/accounts/${encodeURIComponent(accountId)}/holds`, token);
+}
+/** The idempotency key is sent as a header; reuse it to retry the same hold safely. */
+export function createHoldByAccountNumber(token: string, fromAccountId: string, toAccountNumber: string,
+                                          amount: number, expiresInSeconds: number, idempotencyKey: string) {
+  return request<Hold>('/holds/by-account-number', token, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
+    body: JSON.stringify({ fromAccountId, toAccountNumber, amount, expiresInSeconds }),
+  });
+}
+/** Posts the hold; without an amount, the full held amount. Only the payee can do this. */
+export function postHold(token: string, holdId: string, amount?: number) {
+  return request<Hold>(`/holds/${encodeURIComponent(holdId)}/post`, token, {
+    method: 'POST',
+    body: JSON.stringify(amount === undefined ? {} : { amount }),
+  });
+}
+/** Releases the hold. Only the payee can do this. */
+export function voidHold(token: string, holdId: string) {
+  return request<Hold>(`/holds/${encodeURIComponent(holdId)}/void`, token, { method: 'POST' });
 }

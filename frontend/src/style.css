@@ -7,3 +7,32 @@ aside .nav.active{background:#e9f0ff;color:#225ac8}
 aside .nav:hover{background:#f0f4fc}
 .history-page{margin-top:28px}.history-toolbar{display:flex;gap:16px;flex-wrap:wrap;align-items:end}.history-toolbar label{flex:1;min-width:175px;margin:0}.history-toolbar select,.history-toolbar input{display:block;width:100%;border:1px solid #dce3ee;border-radius:9px;padding:12px;background:white;margin-top:8px;font:inherit}.history-scroll{overflow-x:auto;margin-top:24px}.history-table{border-collapse:collapse;width:100%;min-width:550px;text-align:left;font-size:13px}.history-table th{color:#77849a;font-weight:600;background:#f6f8fc}.history-table th,.history-table td{padding:15px 12px;border-bottom:1px solid #edf0f5}.amount-cell{text-align:right;font-weight:700;white-space:nowrap}
 @media(max-width:850px){aside .nav{font-size:0;justify-content:center;padding:13px 5px}aside .nav svg{min-width:19px}}
+
+/* Holds */
+.holds-page{margin-top:28px}
+.holds-page .lower{margin-top:22px}
+select{width:100%;border:1px solid #dce3ee;border-radius:9px;padding:12px;background:#fff;margin-top:8px;font:inherit}
+.balance-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:20px 0 0}
+.balance-strip div{background:#f6f8fc;border-radius:10px;padding:14px 16px}
+.balance-strip dt{font-size:12px;color:#77849a}
+.balance-strip dd{margin:6px 0 0;font-size:19px;font-weight:700;color:#1d2939}
+.balance-strip dd.strong{color:#225ac8}
+.notice{background:#ecfdf3;border:1px solid #abefc6;color:#067647;padding:12px;border-radius:9px;margin:16px 0;font-size:13px}
+.panel h2{display:flex;align-items:center;gap:8px}
+.hold-list{margin-top:14px}
+.hold-row{padding:14px 0;border-bottom:1px solid #eff2f7}
+.hold-row:last-child{border-bottom:0}
+.hold-main{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.hold-main strong{font-size:16px;margin-right:8px}
+.hold-party{color:#77849a;font-size:13px}
+.hold-meta{color:#8791a3;font-size:12px;margin-top:4px}
+.hold-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
+.hold-actions input{width:96px;margin:0;padding:9px}
+.hold-actions .outline{padding:9px 12px;font-size:13px}
+.primary-small{display:flex;align-items:center;gap:6px;background:#225ac8;color:#fff;border:0;border-radius:8px;padding:9px 12px;font-weight:600;font-size:13px}
+.outline.danger{color:#a61b29;border-color:#f2b6b6}
+.badge{font-size:11px;font-weight:700;letter-spacing:.5px;padding:4px 9px;border-radius:999px;white-space:nowrap}
+.badge.pending{background:#fff6e5;color:#b54708}
+.badge.posted{background:#ecfdf3;color:#067647}
+.badge.voided,.badge.expired{background:#f2f4f7;color:#667085}
+.account-card .pending-line{color:#b54708}
