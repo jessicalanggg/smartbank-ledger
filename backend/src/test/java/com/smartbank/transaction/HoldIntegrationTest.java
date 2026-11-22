@@ -291,6 +291,29 @@ class HoldIntegrationTest {
     }
 
     @Test
+    void holdCanBePlacedByAccountNumber() throws Exception {
+        UUID payer = user();
+        UUID from = ownedAccount(payer, "100.00"), to = account("0.00");
+        String number = jdbc.queryForObject("SELECT account_number FROM accounts WHERE id = ?", String.class, to);
+        String body = """
+                {"fromAccountId":"%s","toAccountNumber":" %s ","amount":"25.00"}""".formatted(from, number);
+        String json = mvc.perform(post("/api/v1/holds/by-account-number").with(as(payer)).header("Idempotency-Key", "by-number-1")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.toAccountId").value(to.toString()))
+                .andReturn().getResponse().getContentAsString();
+        // Retrying replays; an unknown number is a 409, like transfers.
+        mvc.perform(post("/api/v1/holds/by-account-number").with(as(payer)).header("Idempotency-Key", "by-number-1")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(content().string(json));
+        mvc.perform(post("/api/v1/holds/by-account-number").with(as(payer)).header("Idempotency-Key", "by-number-2")
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"fromAccountId":"%s","toAccountNumber":"NOPE-1","amount":"1.00"}""".formatted(from)))
+                .andExpect(status().isConflict());
+        assertAccount(from, "100.00", "25.00", "0.00");
+    }
+
+    @Test
     void unknownHoldIs404AndInvalidAmountIs400() throws Exception {
         UUID someone = user();
         mvc.perform(post("/api/v1/holds/{id}/void", UUID.randomUUID()).with(as(someone)))

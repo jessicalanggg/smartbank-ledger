@@ -20,11 +20,14 @@ public class HoldController {
     private final HoldService holds;
     private final AccessService access;
     private final IdempotencyService idempotency;
+    private final com.smartbank.account.AccountRepository accounts;
 
-    public HoldController(HoldService holds, AccessService access, IdempotencyService idempotency) {
+    public HoldController(HoldService holds, AccessService access, IdempotencyService idempotency,
+                          com.smartbank.account.AccountRepository accounts) {
         this.holds = holds;
         this.access = access;
         this.idempotency = idempotency;
+        this.accounts = accounts;
     }
 
     /** Idempotent by the Idempotency-Key header or requestKey field, scoped to the caller. */
@@ -37,6 +40,23 @@ public class HoldController {
                 IdempotencyService.fingerprint("hold", request.fromAccountId(), request.toAccountId(), request.amount(), ttl),
                 HttpStatus.CREATED, op -> holds.create(new CreateHoldRequest(
                         request.fromAccountId(), request.toAccountId(), request.amount(), op, request.expiresInSeconds())));
+    }
+
+    /** Places a hold on a payee given by account number. Idempotent like POST /holds. */
+    @PostMapping("/holds/by-account-number")
+    public ResponseEntity<String> createByAccountNumber(@Valid @RequestBody CreateHoldByAccountNumberRequest request,
+            @RequestHeader(value = IdempotencyService.HEADER, required = false) String key) {
+        access.requireOwner(request.fromAccountId());
+        String number = request.toAccountNumber().trim();
+        long ttl = request.expiresInSeconds() == null ? HoldService.DEFAULT_TTL.toSeconds() : request.expiresInSeconds();
+        return idempotency.execute(key, request.requestKey(),
+                IdempotencyService.fingerprint("hold-by-number", request.fromAccountId(), number, request.amount(), ttl),
+                HttpStatus.CREATED, op -> {
+                    UUID to = accounts.findByAccountNumber(number)
+                            .orElseThrow(() -> new BankingException("Destination account not found")).getId();
+                    return holds.create(new CreateHoldRequest(request.fromAccountId(), to, request.amount(), op,
+                            request.expiresInSeconds()));
+                });
     }
 
     @GetMapping("/holds/{id}")
