@@ -145,9 +145,14 @@ public class BankingService {
         for (int i = 0; i < legs.size(); i++)
             if (legs.get(i).fromAccountId().equals(legs.get(i).toAccountId()))
                 throw new BankingException("Transfer " + i + ": source and destination must differ");
+        requireKey(request.requestKey());
+        return batcher != null ? batcher.submitLinked(request) : linkedTransferDirect(request);
+    }
+
+    /** A linked transfer in its own transaction, without batching. Legs are already validated. */
+    LinkedTransferResponse linkedTransferDirect(LinkedTransferRequest request) {
+        List<LinkedTransferRequest.Leg> legs = request.transfers();
         String key = request.requestKey();
-        if (key == null || key.isBlank())
-            throw new IllegalArgumentException("A request key is required");
         var previous = transactions.findByRequestKey(key);
         if (previous.isPresent())
             return replayLinked(previous.get(), legs);
@@ -206,7 +211,7 @@ public class BankingService {
         return new LinkedTransferResponse(linkId, posted);
     }
 
-    private LinkedTransferResponse replayLinked(BankingTransaction prior, List<LinkedTransferRequest.Leg> legs) {
+    LinkedTransferResponse replayLinked(BankingTransaction prior, List<LinkedTransferRequest.Leg> legs) {
         if (prior.getLinkId() == null)
             throw new BankingException("Request key was already used for a different operation");
         List<BankingTransaction> stored = transactions.findByLinkIdOrderByLinkIndex(prior.getLinkId());

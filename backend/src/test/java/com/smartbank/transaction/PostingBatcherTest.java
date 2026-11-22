@@ -258,6 +258,59 @@ class PostingBatcherTest {
         assertMoney("90.00", balance(a));
     }
 
+    private static PostingBatcher.Pending linked(String key, LinkedTransferRequest.Leg... legs) {
+        return new PostingBatcher.Pending(PostingBatcher.Posting.linked(new LinkedTransferRequest(List.of(legs), key)),
+                new CompletableFuture<>());
+    }
+
+    private static LinkedTransferRequest.Leg leg(UUID from, UUID to, String amount) {
+        return new LinkedTransferRequest.Leg(from, to, new BigDecimal(amount));
+    }
+
+    @Test
+    void linkedGroupsPostAllOrNothingInsideABatch() {
+        UUID a = account("100.00"), b = account("0.00"), c = account("0.00");
+        var before = pending(a, b, "10.00", key());
+        var tooBig = linked(key(), leg(a, b, "50.00"), leg(a, c, "45.00"));   // a has only 90 left
+        var fits = linked(key(), leg(a, b, "50.00"), leg(b, c, "55.00"));     // b passes on what it receives
+        var after = pending(a, c, "5.00", key());
+
+        batcher.process(List.of(before, tooBig, fits, after));
+
+        assertInstanceOf(TransactionResponse.class, outcome(before));
+        assertEquals("BankingException: Insufficient funds in account " + a, outcome(tooBig));
+        LinkedTransferResponse group = (LinkedTransferResponse) outcome(fits);
+        assertEquals(2, group.transfers().size());
+        assertEquals(List.of(0, 1), group.transfers().stream().map(TransactionResponse::linkIndex).toList());
+        assertInstanceOf(TransactionResponse.class, outcome(after));
+        assertMoney("35.00", balance(a));
+        assertMoney("5.00", balance(b));
+        assertMoney("60.00", balance(c));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM banking_transactions WHERE amount = 45.00 AND source_account_id = ?",
+                Integer.class, a), "No leg of the rejected group was written");
+    }
+
+    @Test
+    void linkedKeysAreSharedWithOtherPostingsAndReplayed() {
+        UUID a = account("100.00"), b = account("0.00");
+        String k = key();
+        var group = linked(k, leg(a, b, "10.00"), leg(a, b, "5.00"));
+        var transferSameKey = pending(a, b, "10.00", k);
+        var groupRetry = linked(k, leg(a, b, "10.00"), leg(a, b, "5.00"));
+
+        batcher.process(List.of(group, transferSameKey, groupRetry));
+
+        LinkedTransferResponse posted = (LinkedTransferResponse) outcome(group);
+        assertEquals("BankingException: Request key was already used for a different operation", outcome(transferSameKey));
+        assertEquals(posted, outcome(groupRetry));
+
+        // Once committed, the group is replayed from the database in a later batch.
+        var later = linked(k, leg(a, b, "10.00"), leg(a, b, "5.00"));
+        batcher.process(List.of(later));
+        assertEquals(posted.linkId(), ((LinkedTransferResponse) outcome(later)).linkId());
+        assertMoney("85.00", balance(a));
+    }
+
     @Test
     void concurrentCallersShareBatches() throws Exception {
         UUID hot = account("0.00");

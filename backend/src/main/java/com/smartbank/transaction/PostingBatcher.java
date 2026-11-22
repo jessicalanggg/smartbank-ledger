@@ -20,7 +20,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Group commit for transfers, deposits and withdrawals. Concurrent requests queue
+ * Group commit for transfers, deposits, withdrawals and linked transfers. Concurrent requests queue
  * up; a worker takes everything queued (up to a maximum) and posts it in one
  * database transaction:
  *
@@ -30,9 +30,11 @@ import java.util.concurrent.atomic.AtomicLong;
  *    order every other path uses.
  * 3. Decide each posting in arrival order against the locked balances, as if they
  *    ran one after another: a deposit needs its account to exist, a withdrawal needs
- *    available funds, a transfer needs both accounts, one currency and funds. A
- *    rejected posting gets its own error and does not affect the others, and a
- *    withdrawal can use money deposited earlier in the same batch.
+ *    available funds, a transfer needs both accounts, one currency and funds, and a
+ *    linked transfer needs all of that for every leg, with funds checked on each
+ *    account's net change across the group. A rejected posting (or group) gets its
+ *    own error and does not affect the others, and a withdrawal can use money
+ *    deposited earlier in the same batch.
  * 4. Write all accepted postings, their ledger entries, events and webhook
  *    deliveries in one statement, and the net balance change per account in one
  *    batch.
@@ -55,28 +57,49 @@ public class PostingBatcher {
     private static final Logger log = LoggerFactory.getLogger(PostingBatcher.class);
 
     /**
-     * One deposit (from null), withdrawal (to null) or transfer (both set), with its
-     * request key.
+     * One deposit (from null), withdrawal (to null), transfer (both set), or linked
+     * transfer (legs set, all posting together or not at all), with its request key.
      */
-    record Posting(TransactionType type, UUID from, UUID to, BigDecimal amount, String key) {
+    record Posting(TransactionType type, UUID from, UUID to, BigDecimal amount, String key,
+                   List<LinkedTransferRequest.Leg> legs) {
         static Posting transfer(TransferRequest r) {
-            return new Posting(TransactionType.TRANSFER, r.fromAccountId(), r.toAccountId(), r.amount(), r.requestKey());
+            return new Posting(TransactionType.TRANSFER, r.fromAccountId(), r.toAccountId(), r.amount(), r.requestKey(), null);
         }
         static Posting deposit(UUID account, MoneyRequest r) {
-            return new Posting(TransactionType.DEPOSIT, null, account, r.amount(), r.requestKey());
+            return new Posting(TransactionType.DEPOSIT, null, account, r.amount(), r.requestKey(), null);
         }
         static Posting withdrawal(UUID account, MoneyRequest r) {
-            return new Posting(TransactionType.WITHDRAWAL, account, null, r.amount(), r.requestKey());
+            return new Posting(TransactionType.WITHDRAWAL, account, null, r.amount(), r.requestKey(), null);
         }
+        static Posting linked(LinkedTransferRequest r) {
+            return new Posting(TransactionType.TRANSFER, null, null, null, r.requestKey(), List.copyOf(r.transfers()));
+        }
+        boolean isLinked() { return legs != null; }
         /** The account a single-account posting is about. */
         UUID account() { return type == TransactionType.DEPOSIT ? to : from; }
         boolean sameAs(Posting o) {
+            if (isLinked() || o.isLinked()) return isLinked() && o.isLinked() && sameLegs(legs, o.legs);
             return type == o.type && java.util.Objects.equals(from, o.from) && java.util.Objects.equals(to, o.to)
                     && amount.compareTo(o.amount) == 0;
         }
+        private static boolean sameLegs(List<LinkedTransferRequest.Leg> a, List<LinkedTransferRequest.Leg> b) {
+            if (a.size() != b.size()) return false;
+            for (int i = 0; i < a.size(); i++)
+                if (!a.get(i).fromAccountId().equals(b.get(i).fromAccountId()) || !a.get(i).toAccountId().equals(b.get(i).toAccountId())
+                        || a.get(i).amount().compareTo(b.get(i).amount()) != 0) return false;
+            return true;
+        }
+        /** Every account the posting touches. */
+        List<UUID> accounts() {
+            List<UUID> ids = new ArrayList<>();
+            if (isLinked()) legs.forEach(l -> { ids.add(l.fromAccountId()); ids.add(l.toAccountId()); });
+            else { if (from != null) ids.add(from); if (to != null) ids.add(to); }
+            return ids;
+        }
     }
 
-    record Pending(Posting posting, CompletableFuture<TransactionResponse> result) { }
+    /** The result is a TransactionResponse, or a LinkedTransferResponse for a linked transfer. */
+    record Pending(Posting posting, CompletableFuture<Object> result) { }
 
     private final BankingService banking;
     private final AccountRepository accounts;
@@ -113,8 +136,17 @@ public class PostingBatcher {
         }
     }
 
-    /** Queues the posting and waits for its batch to commit. */
+    /** Queues a deposit, withdrawal or transfer and waits for its batch to commit. */
     public TransactionResponse submit(Posting posting) {
+        return (TransactionResponse) await(posting);
+    }
+
+    /** Queues a linked transfer and waits for its batch to commit. */
+    public LinkedTransferResponse submitLinked(LinkedTransferRequest request) {
+        return (LinkedTransferResponse) await(Posting.linked(request));
+    }
+
+    private Object await(Posting posting) {
         Pending pending = new Pending(posting, new CompletableFuture<>());
         if (!running) throw new IllegalStateException("Posting batcher is stopped");
         queue.add(pending);
@@ -195,12 +227,13 @@ public class PostingBatcher {
         });
     }
 
-    record Outcome(TransactionResponse response, RuntimeException error) {
-        static Outcome ok(TransactionResponse r) { return new Outcome(r, null); }
+    record Outcome(Object response, RuntimeException error) {
+        static Outcome ok(Object r) { return new Outcome(r, null); }
         static Outcome failed(RuntimeException e) { return new Outcome(null, e); }
     }
 
-    private TransactionResponse direct(Posting p) {
+    private Object direct(Posting p) {
+        if (p.isLinked()) return banking.linkedTransferDirect(new LinkedTransferRequest(p.legs(), p.key()));
         return switch (p.type()) {
             case TRANSFER -> banking.transferDirect(new TransferRequest(p.from(), p.to(), p.amount(), p.key()));
             case DEPOSIT -> banking.depositDirect(p.to(), new MoneyRequest(p.amount(), p.key()));
@@ -220,10 +253,7 @@ public class PostingBatcher {
         // 2. Lock every account the new postings touch, in the shared lock order.
         Set<UUID> ids = new TreeSet<>(UuidOrder.COMPARATOR);
         for (Pending p : batch)
-            if (!committed.containsKey(p.posting().key())) {
-                if (p.posting().from() != null) ids.add(p.posting().from());
-                if (p.posting().to() != null) ids.add(p.posting().to());
-            }
+            if (!committed.containsKey(p.posting().key())) ids.addAll(p.posting().accounts());
         Map<UUID, Account> locked = new HashMap<>();
         if (!ids.isEmpty()) accounts.lockAllInOrder(ids).forEach(a -> locked.put(a.getId(), a));
         Map<UUID, BigDecimal> available = new HashMap<>();
@@ -233,6 +263,7 @@ public class PostingBatcher {
         Map<UUID, BigDecimal> net = new TreeMap<>(UuidOrder.COMPARATOR);
         List<BankingTransaction> rows = new ArrayList<>();
         List<Pending> accepted = new ArrayList<>();
+        Map<Pending, UUID> linkIds = new HashMap<>();
         Map<String, Pending> acceptedByKey = new HashMap<>();
         List<Pending> followers = new ArrayList<>();
         for (Pending p : batch) {
@@ -244,6 +275,28 @@ public class PostingBatcher {
             }
             if (acceptedByKey.containsKey(r.key())) {
                 followers.add(p);  // same key as an earlier posting in this batch
+                continue;
+            }
+            if (r.isLinked()) {
+                // All legs or none: check the group as a whole against the balances so far.
+                RuntimeException rejection = checkLinked(r, locked, available);
+                if (rejection != null) {
+                    outcomes.put(p, Outcome.failed(rejection));
+                    continue;
+                }
+                UUID linkId = UUID.randomUUID();
+                for (int i = 0; i < r.legs().size(); i++) {
+                    var leg = r.legs().get(i);
+                    available.merge(leg.fromAccountId(), leg.amount().negate(), BigDecimal::add);
+                    available.merge(leg.toAccountId(), leg.amount(), BigDecimal::add);
+                    net.merge(leg.fromAccountId(), leg.amount().negate(), BigDecimal::add);
+                    net.merge(leg.toAccountId(), leg.amount(), BigDecimal::add);
+                    rows.add(BankingTransaction.linkedLeg(linkId, i, leg.fromAccountId(), leg.toAccountId(), leg.amount(),
+                            locked.get(leg.fromAccountId()).getCurrency(), r.key()));
+                }
+                linkIds.put(p, linkId);
+                accepted.add(p);
+                acceptedByKey.put(r.key(), p);
                 continue;
             }
             RuntimeException rejection = check(r, locked, available);
@@ -268,7 +321,16 @@ public class PostingBatcher {
         // 4. One statement for all postings, one batch for all balance changes.
         if (!rows.isEmpty()) {
             List<TransactionResponse> posted = writer.postAll(rows);
-            for (int i = 0; i < accepted.size(); i++) outcomes.put(accepted.get(i), Outcome.ok(posted.get(i)));
+            int row = 0;
+            for (Pending p : accepted) {
+                if (p.posting().isLinked()) {
+                    int legs = p.posting().legs().size();
+                    outcomes.put(p, Outcome.ok(new LinkedTransferResponse(linkIds.get(p), List.copyOf(posted.subList(row, row + legs)))));
+                    row += legs;
+                } else {
+                    outcomes.put(p, Outcome.ok(posted.get(row++)));
+                }
+            }
             List<PostingWriter.BalanceChange> changes = net.entrySet().stream()
                     .filter(e -> e.getValue().signum() != 0)
                     .map(e -> new PostingWriter.BalanceChange(e.getKey(), e.getValue()))
@@ -299,7 +361,38 @@ public class PostingBatcher {
         return null;
     }
 
+    /**
+     * Why a linked transfer cannot post given the balances so far, or null if it can:
+     * every leg's accounts must exist and share a currency, and every account must
+     * cover its net change across the group. Same checks, in the same order, as the
+     * unbatched path, so the error is the same.
+     */
+    private static RuntimeException checkLinked(Posting r, Map<UUID, Account> locked, Map<UUID, BigDecimal> available) {
+        Map<UUID, BigDecimal> groupNet = new TreeMap<>(UuidOrder.COMPARATOR);
+        for (int i = 0; i < r.legs().size(); i++) {
+            var leg = r.legs().get(i);
+            Account source = locked.get(leg.fromAccountId()), target = locked.get(leg.toAccountId());
+            if (source == null) return new AccountNotFoundException(leg.fromAccountId());
+            if (target == null) return new AccountNotFoundException(leg.toAccountId());
+            if (!source.getCurrency().equals(target.getCurrency()))
+                return new BankingException("Transfer " + i + ": cross-currency transfers are not supported");
+            groupNet.merge(leg.fromAccountId(), leg.amount().negate(), BigDecimal::add);
+            groupNet.merge(leg.toAccountId(), leg.amount(), BigDecimal::add);
+        }
+        for (var change : groupNet.entrySet())
+            if (change.getValue().signum() < 0 && available.get(change.getKey()).compareTo(change.getValue().negate()) < 0)
+                return new BankingException("Insufficient funds in account " + change.getKey());
+        return null;
+    }
+
     private Outcome replay(BankingTransaction prior, Posting r) {
+        if (r.isLinked()) {
+            try {
+                return Outcome.ok(banking.replayLinked(prior, r.legs()));
+            } catch (BankingException e) {
+                return Outcome.failed(e);
+            }
+        }
         try {
             return Outcome.ok(r.type() == TransactionType.TRANSFER
                     ? banking.replayTransfer(prior, new TransferRequest(r.from(), r.to(), r.amount(), r.key()))
