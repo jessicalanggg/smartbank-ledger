@@ -4,6 +4,8 @@ An [MCP](https://modelcontextprotocol.io) server that lets an AI agent pay throu
 
 The agent only ever holds the mandate's key. Every payment is decided by the bank, inside the same database transaction that moves the money: within the limits it is paid at once, over them it is held for the account owner's approval or rejected. No tool here can raise a limit, and the system prompt is not what keeps the agent in budget.
 
+![Claude Code paying through the SmartBank MCP server, then the customer approving the held payment](../docs/media/agent-demo.gif)
+
 ## The MCP server
 
 `src/server.ts`, over stdio. Tools:
@@ -20,8 +22,10 @@ Bank refusals (unknown payee, insufficient funds, revoked key) come back as tool
 Use it from Claude Code with a mandate's key (create one with `POST /api/v1/mandates`):
 
 ```bash
-claude mcp add smartbank -e SMARTBANK_AGENT_KEY=sbk_agent_... -e SMARTBANK_URL=http://localhost:8081 -- npx tsx /absolute/path/to/agent-demo/src/server.ts
+claude mcp add smartbank -e SMARTBANK_AGENT_KEY=sbk_agent_... -e SMARTBANK_URL=http://localhost:8081 -- /absolute/path/to/agent-demo/node_modules/.bin/tsx /absolute/path/to/agent-demo/src/server.ts
 ```
+
+Run `npm install` in this folder first. The command uses this folder's own `tsx`, so it works from any directory (`npx tsx` outside this folder would try to download it).
 
 ## The demo
 

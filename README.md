@@ -2,6 +2,10 @@
 
 **A double-entry banking ledger that lets AI agents spend money within limits the database enforces.** Java 21, Spring Boot and PostgreSQL, with a React frontend and an MCP server for agents.
 
+![Claude Code shops through the SmartBank MCP server: the headphones and cables are paid within the agent's limits, the monitor is held, and the customer approves it](docs/media/agent-demo.gif)
+
+*Claude Code pays through SmartBank's MCP server. The headphones (45.00) and cables (24.00) fit the agent's limits and post at once; the 180.00 monitor is over the 50.00 per-payment limit, so the bank holds it until the customer approves it. ([MP4](docs/media/agent-demo.mp4))*
+
 **Educational simulation only.** All data is synthetic. Do not expose it to the internet or use real personal or financial data.
 
 ## Why it is interesting
@@ -120,7 +124,6 @@ Run the tests with `cd backend && mvn test` (JDK 21), or entirely in Docker as d
 Not implemented: refresh tokens or token revocation, MFA, account opening, pagination beyond the newest 100 transactions, FX revaluation and FX reversals. The demo password, JWT secret and webhook encryption key in `infra/compose.yml` are for local use only, and Compose allows http and private webhook targets so a receiver on your machine works; production must set `WEBHOOK_ENCRYPTION_KEY` and leave `WEBHOOK_ALLOW_HTTP` and `WEBHOOK_ALLOW_PRIVATE_TARGETS` off.
 
 Next steps:
-- Record a run of the Claude agent demo for this README.
 - Re-run the throughput benchmarks on a quiet machine.
 - Close the remaining DNS-rebinding window for webhooks with an egress proxy, and allow rotating the secret-encryption key.
 - Frontend navigation on phones (the sidebar is hidden below 520 px, leaving only the Overview page).
