@@ -10,7 +10,9 @@ import java.math.BigDecimal;
  * Checks the books: the ledger as a whole balances, every transaction balances,
  * every cached account balance equals the sum of that account's entries, pending
  * amounts equal the open holds, every posted hold matches its transfer, and the
- * outbox holds exactly one event per posted transaction and per hold state.
+ * outbox holds exactly one event per posted transaction and per hold state, debits
+ * equal credits within each currency, and every entry lands on exactly one account
+ * in the chart of accounts.
  * Runs in one REPEATABLE READ snapshot so concurrent postings cannot make a
  * consistent ledger look inconsistent.
  */
@@ -25,12 +27,15 @@ public class LedgerReconciliation {
     public record Report(BigDecimal ledgerTotal, int unbalancedTransactions,
                          int transactionsWithoutEntries, int accountsOutOfBalance,
                          int accountsWithWrongPendingAmounts, int postedHoldsNotMatchingTransfer,
-                         int transactionsWithoutExactlyOneEvent, int holdsWithWrongEvents) {
+                         int transactionsWithoutExactlyOneEvent, int holdsWithWrongEvents,
+                         int currenciesOutOfBalance, int entriesWithoutChartAccount, int customerAccountsWithoutChartAccount) {
         public boolean isClean() {
             return ledgerTotal.signum() == 0 && unbalancedTransactions == 0
                     && transactionsWithoutEntries == 0 && accountsOutOfBalance == 0
                     && accountsWithWrongPendingAmounts == 0 && postedHoldsNotMatchingTransfer == 0
-                    && transactionsWithoutExactlyOneEvent == 0 && holdsWithWrongEvents == 0;
+                    && transactionsWithoutExactlyOneEvent == 0 && holdsWithWrongEvents == 0
+                    && currenciesOutOfBalance == 0 && entriesWithoutChartAccount == 0
+                    && customerAccountsWithoutChartAccount == 0;
         }
     }
 
@@ -83,7 +88,18 @@ public class LedgerReconciliation {
                       <> CASE WHEN h.status = 'PENDING' THEN 0 ELSE 1 END
                    OR (h.status <> 'PENDING' AND NOT EXISTS (SELECT 1 FROM outbox_events o
                        WHERE o.aggregate_id = h.id AND o.event_type = 'hold.' || lower(h.status)))""", Integer.class);
+        // Debits equal credits within every currency, not just overall.
+        Integer currencies = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM (SELECT currency FROM ledger_entries GROUP BY currency HAVING SUM(amount) <> 0) c""",
+                Integer.class);
+        // Every entry lands on exactly one account in the chart of accounts.
+        Integer unmapped = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM ledger_entries e
+                WHERE (SELECT COUNT(*) FROM journal_lines j WHERE j.entry_id = e.id) <> 1""", Integer.class);
+        Integer customersWithoutChart = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM accounts a
+                WHERE NOT EXISTS (SELECT 1 FROM ledger_accounts la WHERE la.customer_account_id = a.id)""", Integer.class);
         return new Report(total, unbalanced, withoutEntries, outOfBalance, wrongPending, badPostings,
-                missingEvents, holdEvents);
+                missingEvents, holdEvents, currencies, unmapped, customersWithoutChart);
     }
 }

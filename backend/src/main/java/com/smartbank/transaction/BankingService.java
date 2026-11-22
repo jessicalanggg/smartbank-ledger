@@ -82,6 +82,17 @@ public class BankingService {
         if (key == null || key.isBlank()) throw new IllegalArgumentException("A request key is required");
     }
 
+    /**
+     * Charges a fee: debits the customer's account and credits fee revenue. Like a
+     * withdrawal, it needs available funds. Not batched; fees are rare.
+     */
+    public TransactionResponse chargeFee(UUID accountId, MoneyRequest request) {
+        requireKey(request.requestKey());
+        return idempotent(request.requestKey(),
+                prior -> replay(prior, TransactionType.FEE, accountId, request.amount()),
+                () -> postSingleAccount(TransactionType.FEE, accountId, request));
+    }
+
     /** A deposit in its own transaction, without batching. */
     TransactionResponse depositDirect(UUID accountId, MoneyRequest request) {
         return idempotent(request.requestKey(),
@@ -418,6 +429,10 @@ public class BankingService {
             case OPENING_BALANCE -> List.of(
                     LedgerEntry.internal(id, LedgerAccount.OPENING_EQUITY, amount.negate(), currency, at),
                     LedgerEntry.customer(id, tx.getDestinationAccountId(), amount, currency, at));
+            // A fee: debit the customer, credit fee revenue.
+            case FEE -> List.of(
+                    LedgerEntry.customer(id, tx.getSourceAccountId(), amount.negate(), currency, at),
+                    LedgerEntry.internal(id, LedgerAccount.FEE_REVENUE, amount, currency, at));
             // A reversal follows the original's path backwards; a null side is external clearing.
             case REVERSAL -> List.of(
                     tx.getSourceAccountId() == null

@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Model-based randomized testing. Random sequences of operations (deposits,
- * withdrawals, transfers, linked transfers, reversals, exact retries, conflicting key reuse,
+ * withdrawals, fees, transfers, linked transfers, reversals, exact retries, conflicting key reuse,
  * holds and their post/void/expiry) run against PostgreSQL. A small in-memory model, written
  * independently of the service code, predicts each outcome and every balance.
  * After each operation the outcome and all balances must match the model; at the
@@ -54,9 +54,10 @@ class LedgerModelTest {
 
     enum Outcome { OK, REJECTED, NOT_FOUND }
 
-    sealed interface Op permits Deposit, Withdraw, Transfer, Linked, Reverse, CreateHold, PostHold, VoidHold, ExpireHold { }
+    sealed interface Op permits Deposit, Withdraw, Fee, Transfer, Linked, Reverse, CreateHold, PostHold, VoidHold, ExpireHold { }
     record Deposit(int account, BigDecimal amount, String key) implements Op { }
     record Withdraw(int account, BigDecimal amount, String key) implements Op { }
+    record Fee(int account, BigDecimal amount, String key) implements Op { }
     record Transfer(int from, int to, BigDecimal amount, String key) implements Op { }
     record Leg(int from, int to, BigDecimal amount) { }
     /** A linked transfer: every leg posts or none does. */
@@ -113,6 +114,14 @@ class LedgerModelTest {
                     moneyKeys.put(w.key(), w);
                     return Outcome.OK;
                 }
+                case Fee f -> {
+                    Op prior = moneyKeys.get(f.key());
+                    if (prior != null) return sameRequest(prior, f) ? Outcome.OK : Outcome.REJECTED;
+                    if (available(f.account()).compareTo(f.amount()) < 0) return Outcome.REJECTED;
+                    balance[f.account()] = balance[f.account()].subtract(f.amount());
+                    moneyKeys.put(f.key(), f);
+                    return Outcome.OK;
+                }
                 case Transfer t -> {
                     if (t.from() == t.to()) return Outcome.REJECTED;
                     Op prior = moneyKeys.get(t.key());
@@ -149,6 +158,7 @@ class LedgerModelTest {
                     Op original = moneyKeys.get(v.originalKey());
                     // Reversals target single transactions; the test does not address a linked group by id.
                     if (original == null || original instanceof Linked) return Outcome.NOT_FOUND;
+                    if (original instanceof Fee) return Outcome.REJECTED;  // fees are not reversible
                     if (!(original instanceof Deposit || original instanceof Withdraw || original instanceof Transfer))
                         return Outcome.REJECTED;
                     BigDecimal originalAmount = switch (original) {
@@ -248,6 +258,7 @@ class LedgerModelTest {
             return switch (a) {
                 case Deposit x when b instanceof Deposit y -> x.account() == y.account() && x.amount().compareTo(y.amount()) == 0;
                 case Withdraw x when b instanceof Withdraw y -> x.account() == y.account() && x.amount().compareTo(y.amount()) == 0;
+                case Fee x when b instanceof Fee y -> x.account() == y.account() && x.amount().compareTo(y.amount()) == 0;
                 case Transfer x when b instanceof Transfer y -> x.from() == y.from() && x.to() == y.to() && x.amount().compareTo(y.amount()) == 0;
                 case CreateHold x when b instanceof CreateHold y -> x.from() == y.from() && x.to() == y.to() && x.amount().compareTo(y.amount()) == 0;
                 case Linked x when b instanceof Linked y -> sameLegs(x.legs(), y.legs());
@@ -281,8 +292,10 @@ class LedgerModelTest {
                 op = new Reverse(target, r.nextBoolean() ? null : BigDecimal.valueOf(r.nextInt(1, 4_001), 2), key);
             } else if (kind < 25) {
                 op = new Deposit(a, amount, key);
-            } else if (kind < 37) {
+            } else if (kind < 34) {
                 op = new Withdraw(a, amount, key);
+            } else if (kind < 37) {
+                op = new Fee(a, BigDecimal.valueOf(r.nextInt(1, 1_001), 2), key);
             } else if (kind < 50) {
                 op = new Transfer(a, b, amount, key);  // a == b sometimes, which must be rejected
             } else if (kind < 57) {
@@ -309,8 +322,8 @@ class LedgerModelTest {
                     default -> new ExpireHold(holdKey);
                 };
             }
-            if (op instanceof Deposit || op instanceof Withdraw || op instanceof Transfer || op instanceof Linked
-                    || op instanceof Reverse) moneyOps.add(op);
+            if (op instanceof Deposit || op instanceof Withdraw || op instanceof Fee || op instanceof Transfer
+                    || op instanceof Linked || op instanceof Reverse) moneyOps.add(op);
             ops.add(op);
         }
         return ops;
@@ -320,6 +333,7 @@ class LedgerModelTest {
         return switch (op) {
             case Deposit d -> d.key();
             case Withdraw w -> w.key();
+            case Fee f -> f.key();
             case Transfer t -> t.key();
             case Linked l -> l.key();
             case Reverse v -> v.key();
@@ -376,6 +390,8 @@ class LedgerModelTest {
         switch (op) {
             case Deposit d -> txIds.putIfAbsent(d.key(),
                     banking.deposit(ids.get(d.account()), new MoneyRequest(d.amount(), d.key())).id());
+            case Fee f -> txIds.putIfAbsent(f.key(),
+                    banking.chargeFee(ids.get(f.account()), new MoneyRequest(f.amount(), f.key())).id());
             case Withdraw w -> txIds.putIfAbsent(w.key(),
                     banking.withdraw(ids.get(w.account()), new MoneyRequest(w.amount(), w.key())).id());
             case Transfer t -> txIds.putIfAbsent(t.key(), banking.transfer(

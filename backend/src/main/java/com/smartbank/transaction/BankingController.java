@@ -99,6 +99,15 @@ public class BankingController {
                 HttpStatus.CREATED, op -> service.reverse(id, new ReversalRequest(request.amount(), op)));
     }
 
+    /** Charges a fee to the account, credited to fee revenue. Administrators only. */
+    @PostMapping("/accounts/{id}/fees")
+    public ResponseEntity<String> chargeFee(@PathVariable UUID id, @Valid @RequestBody MoneyRequest request,
+                                            @RequestHeader(value = HEADER, required = false) String key) {
+        access.requireAdmin();
+        return idempotency.execute(key, request.requestKey(), fingerprint("fee", id, request.amount()),
+                HttpStatus.CREATED, op -> service.chargeFee(id, new MoneyRequest(request.amount(), op)));
+    }
+
     @GetMapping("/accounts/{id}/transactions")
     public List<TransactionResponse> history(@PathVariable UUID id) {
         access.requireOwner(id);
