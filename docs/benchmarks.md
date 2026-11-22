@@ -153,7 +153,7 @@ Batches form on their own: while a worker posts one batch, new requests queue fo
 
 **Verified** by the full suite running through the batcher (97 tests): the model-based test, network-cut and `kill -9` crash tests, the 5,000-transfer and mixed hold/transfer concurrency tests, and batch tests for isolation of a rejected transfer, arrival-order decisions, duplicate keys inside a batch, replays, and the deadlock case above.
 
-**Scope.** Transfers (including by account number), deposits and withdrawals are batched, together in the same batches. Linked transfers, reversals and holds still post one at a time.
+**Scope.** Transfers (including by account number), deposits, withdrawals and linked transfers are batched, together in the same batches. Reversals and holds still post one at a time.
 
 ### Deposits and withdrawals
 
@@ -168,6 +168,20 @@ Deposits and withdrawals join the same batches as transfers and are decided by t
 | 100% | 696 / 593 | 1,296 / 2,289 | 206 / 251 | 412 / 39 |
 
 About 2–5× the throughput, and p99 4–9× lower in five of six pairs; the first all-hot batched run had one slow tail (412 ms).
+
+### Linked transfers
+
+A linked group joins a batch as one unit. It is accepted only if every leg's accounts exist and share a currency and every account covers its net change across the group, given the balances so far in the batch; then all its legs are written, otherwise none, and the rest of the batch is unaffected. The checks and error messages are the same as on the unbatched path. The group's request key is shared with the other postings in the batch, and a committed group is replayed.
+
+`-Dbenchmark.mode=linked`: groups of two legs, one to the hot account (or a random one), one to another random customer. Interleaved, 3,000 groups per row, 32 threads; machine load 4.4–8.3:
+
+| Groups into hot account | Off: groups/s | On: groups/s | Off: p99 ms | On: p99 ms |
+| --- | --- | --- | --- | --- |
+| 0% | 600 / 701 | 1,265 / 759 | 238 / 164 | 48 / 197 |
+| 50% | 755 / 672 | 1,386 / 1,530 | 178 / 355 | 41 / 47 |
+| 100% | 608 / 395 | 1,650 / 1,549 | 322 / 354 | 33 / 44 |
+
+With the hot account involved, about 2–4× the throughput and p99 under 50 ms. With no hot account, one pair improved about 2× and the other barely (759 vs 701 groups/s, with a slower tail).
 
 ## Short locks for holds
 
@@ -191,5 +205,5 @@ Throughput rose about 40–90% where it moved (the second all-hot run was flat),
 ## Possible next steps
 
 - The same short-critical-section design for the hold path.
-- Batch linked transfers too.
+- Batch reversals and holds too.
 - For accounts hotter than one batch per commit can serve, split the balance into several sub-balance rows, or apply credits asynchronously (safe for incoming money because the cached balance can only lag low).
