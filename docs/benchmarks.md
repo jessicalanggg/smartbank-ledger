@@ -118,7 +118,7 @@ Three of those `SELECT`s were hidden Hibernate work: the entities have ids assig
 
 A transfer is now: idempotency lookup, account read, the write, the balance batch, and the commit. The remaining measured ≈1 round trip above those five was not identified.
 
-All 84 tests pass with the new write path, including the model-based test and the network-cut and `kill -9` crash tests.
+All 84 tests pass with the new write path, including the model-based test (now the seeded simulation) and the network-cut and `kill -9` crash tests.
 
 **Throughput not re-measured.** The machine was under heavy unrelated load (load average ≈ 11 on 10 cores) when this was done, which makes throughput numbers unreliable. With the service time now dominated by about 6 instead of 17 round trips, the benchmark above should be re-run on a quiet machine.
 
@@ -151,7 +151,7 @@ Batches form on their own: while a worker posts one batch, new requests queue fo
 - With every transfer paying one account, throughput is about **5–6× higher** and p99 latency falls from hundreds of milliseconds (or seconds) to under 80 ms.
 - Throughput no longer drops as traffic concentrates on one account. The hot case is now the fastest, because one row lock and one commit cover a whole batch of transfers into it.
 
-**Verified** by the full suite running through the batcher (97 tests): the model-based test, network-cut and `kill -9` crash tests, the 5,000-transfer and mixed hold/transfer concurrency tests, and batch tests for isolation of a rejected transfer, arrival-order decisions, duplicate keys inside a batch, replays, and the deadlock case above.
+**Verified** by the full suite running through the batcher (97 tests): the model-based test (now the seeded simulation), network-cut and `kill -9` crash tests, the 5,000-transfer and mixed hold/transfer concurrency tests, and batch tests for isolation of a rejected transfer, arrival-order decisions, duplicate keys inside a batch, replays, and the deadlock case above.
 
 **Scope.** Transfers (including by account number), deposits, withdrawals and linked transfers are batched, together in the same batches. Reversals and holds still post one at a time.
 

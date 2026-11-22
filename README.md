@@ -12,7 +12,7 @@
 - **AI agents get a budget, not a blank check.** A customer gives an agent a key tied to one account, with per-payment and daily limits. The limit is checked and used up in the same transaction as the payment, so 50 agents racing for the last of a budget cannot overspend it. Anything over a limit waits for the customer's approval, and revoking is immediate.
 - **Every request is safe to retry.** Idempotency keys make each payment happen exactly once, even when the server stops between posting and answering.
 - **History cannot be quietly rewritten.** The app connects as a database role that can add to the ledger but cannot update, delete or disable the triggers that protect it. Committed transactions are sealed into a SHA-256 hash chain, and each seal is signed with an Ed25519 key the database never holds, so even someone with full database access who rewrites the whole chain is caught.
-- **It is tested like infrastructure.** Thousands of random concurrent operations checked against an independent model, network cuts and `SIGKILL`s of PostgreSQL under load, and reconciliation of every invariant after every test.
+- **It is tested like infrastructure.** Seeded simulations replay the whole bank, agents included, with crashes and lost responses injected, against an independent model; thousands of concurrent operations; network cuts and `SIGKILL`s of PostgreSQL under load; and reconciliation of every invariant after every test.
 
 ## Architecture
 
@@ -35,7 +35,7 @@ flowchart LR
 | 50 simultaneous agent payments of 3.00 against a 100.00 daily limit | Exactly 33 post (99.00), 17 are refused, every run | [`AgentMandateTest`](backend/src/test/java/com/smartbank/agent/AgentMandateTest.java) |
 | 5,000 random concurrent transfers (32 threads) | Money conserved, no negative balance, no deadlock, ledger reconciles | [`ConcurrencyIntegrationTest`](backend/src/test/java/com/smartbank/transaction/ConcurrencyIntegrationTest.java) |
 | PostgreSQL killed with `SIGKILL` twice under load | Every acknowledged transfer survives, nothing posts twice | [fault testing](docs/fault-testing.md) |
-| 4,800 random operations per run against an independent model | Match after every step; failures shrink to a minimal case | [`LedgerModelTest`](backend/src/test/java/com/smartbank/fault/LedgerModelTest.java) |
+| 40 seeded simulations of the bank, agents included, with crashes before commit and lost responses injected | Every step matches an independent model, nothing happens twice, a seed replays identically, and failures shrink to a few steps | [`LedgerSimulationTest`](backend/src/test/java/com/smartbank/fault/LedgerSimulationTest.java) |
 | A transfer, its entries and both balances altered consistently | Missed by every balance check, caught by the hash chain | [`LedgerSealTest`](backend/src/test/java/com/smartbank/ledger/LedgerSealTest.java) |
 | The whole chain rewritten by someone with full database access | Caught by seal signatures, with no external record | [`SealSignatureTest`](backend/src/test/java/com/smartbank/ledger/SealSignatureTest.java) |
 | The app's own database role tries to update, delete, truncate or disable triggers on history | All 17 attempts refused, while every operation still works | [`AppRoleTest`](backend/src/test/java/com/smartbank/security/AppRoleTest.java) |
@@ -112,7 +112,7 @@ Run the tests with `cd backend && mvn test` (JDK 21), or entirely in Docker as d
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
 - `agent-demo`: MCP server for agent payments, and a Claude agent demo (TypeScript)
 - `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator, V14 balance checkpoints, V15 multi-currency and FX, V16 agent mandates)
-- `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
+- `backend/src/test`: unit, integration, concurrency, simulation and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `docs`: design, testing, API, benchmarks and fault testing
 - `infra/compose.yml`: local PostgreSQL and backend

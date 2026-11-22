@@ -1,27 +1,33 @@
 # Fault testing
 
-Two kinds of tests go beyond fixed examples: model-based randomized sequences, and fault injection under load. Both run in the normal test suite (`mvn test`) against real PostgreSQL in Testcontainers.
+Two kinds of tests go beyond fixed examples: a seeded simulation of the whole bank against an independent model, and fault injection under load. Both run in the normal test suite (`mvn test`) against real PostgreSQL in Testcontainers.
 
-## Model-based randomized testing
+## Seeded simulation
 
-[`LedgerModelTest`](../backend/src/test/java/com/smartbank/fault/LedgerModelTest.java) generates random sequences of operations:
+[`LedgerSimulationTest`](../backend/src/test/java/com/smartbank/fault/LedgerSimulationTest.java) runs the bank from a single seed. The seed decides every request and every fault:
 
-- deposits, withdrawals and transfers, including same-account transfers, which must be rejected;
-- exact retries of earlier requests, and conflicting reuse of a request key;
-- hold creation (including retries), full and partial posts, voids, expiry, and operations on holds that do not exist.
+- **Requests:** deposits, withdrawals, fees, transfers (including same-account ones, which must be rejected), linked transfers, reversals, holds and their posts, voids and expiry, exact retries, conflicting reuse of a key, and requests for things that do not exist. AI agents get mandates with random limits, allowed payees and approval settings, then pay within and over their limits, retry, and have their payments approved, declined, revoked or left to expire.
+- **Faults:** about 6% of requests **crash** inside their database transaction, after every write and just before commit, so nothing may change; the client sends the request again a few steps later. About 6% **lose their response** after committing; the client retries with the same key and must get the same transaction, hold or payment back, with nothing happening twice.
 
-A small in-memory model, written independently of the service code, predicts the outcome of every operation (success, rejection, or not found) and every account's balance, pending debits and pending credits. After each operation the real outcome and all balances must match the model; after each sequence the ledger must reconcile.
+A small in-memory model, written independently of the service code, predicts every outcome. After every step, the outcome, every balance and pending amount, every agent payment's status and every mandate's spending must match it. The books are reconciled every 25 steps and at the end of each run, including the hash chain and the agent spending checks.
 
-On a mismatch, the test shrinks the sequence by removing operations while it still fails, and reports the seed and the minimal sequence. Reproduce with `-Dmodel.seed=<seed>`; widen coverage with `-Dmodel.sequences=500 -Dmodel.length=200`.
+Requests run one at a time, so a seed replays exactly: the test runs its first seed twice and checks the two traces (every step, fault and outcome) are identical. On a mismatch it shrinks the run to the fewest steps that still fail and prints the seed. Reproduce with `-Dsim.seed=<seed>`; widen coverage with `-Dsim.runs=500 -Dsim.length=200`.
 
-**Default run:** 60 sequences of 80 operations (4,800 operations), all matching the model.
+**Default run:** 40 seeds of 100 requests each, plus the retries the faults cause, all matching the model.
 
-**Checked against a planted bug.** Changing `voidHold` so it did not release the payee's pending credit made the test fail at step 44 of a sequence and shrink it to the two-operation reproduction:
+**Checked against planted bugs.**
 
-```
-CreateHold[from=0, to=3, amount=68.97, key=…]
-VoidHold[holdKey=…]
-```
+- Letting an agent overspend its daily limit by 5.00 made a run fail; it shrank to three steps, and the database's own limit trigger had refused the overspend too:
+
+  ```
+  CreateMandate[account=3, perPayment=30.94, daily=30.94, payees=[], ask=true]
+  AgentPay[payee=1, amount=12.39]
+  AgentPay[payee=1, amount=18.95]
+  ```
+
+- (Earlier, with holds only:) changing `voidHold` so it did not release the payee's pending credit failed at step 44 and shrank to a hold and its void.
+
+**What it does not cover:** concurrency. Requests run one at a time, which is what makes a seed replayable; interleavings are covered by the concurrency tests and by the fault injection below, which are not replayable. Time is real, so expiry is driven by calling the expiry jobs with a future moment, and a run never crosses a day boundary.
 
 ## Fault injection under load
 

@@ -89,7 +89,7 @@ Every attempt for an event sends the same body; only the signature timestamp and
 - six concurrent workers deliver 120 events exactly once each;
 - a deactivated endpoint receives nothing more; the endpoint API validates URLs and event types and is private to its owner.
 
-Checked against a planted bug: with withdrawals skipping their event, the model-based test failed and shrank the failure to a single withdrawal.
+Checked against a planted bug: with withdrawals skipping their event, the model-based test (now the seeded simulation) failed and shrank the failure to a single withdrawal.
 
 ## Hardening
 
