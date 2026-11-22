@@ -1,28 +1,21 @@
 # SmartBank
 
-**A double-entry banking ledger that lets AI agents spend money within limits the database enforces.** Java 21, Spring Boot and PostgreSQL, with a React frontend and an MCP server for agents.
-
-![Claude Code shops through the SmartBank MCP server: the headphones and cables are paid within the agent's limits, the monitor is held, and the customer approves it](docs/media/agent-demo.gif)
-
-*Claude Code pays through SmartBank's MCP server. The headphones (45.00) and cables (24.00) fit the agent's limits and post at once; the 180.00 monitor is over the 50.00 per-payment limit, so the bank holds it until the customer approves it. ([MP4](docs/media/agent-demo.mp4))*
+**A double-entry banking ledger that stays correct under retries, concurrency and failures.** Java 21, Spring Boot and PostgreSQL, with a React frontend.
 
 **Educational simulation only.** All data is synthetic. Do not expose it to the internet or use real personal or financial data.
 
 ## Why it is interesting
 
-- **The database refuses bad money states, even if the code is wrong.** Every transaction's debits must equal its credits within each currency; history is append-only; balances can never go negative; an agent's spending can never exceed its daily limit. These are PostgreSQL constraints and triggers, not application checks.
-- **AI agents get a budget, not a blank check.** A customer gives an agent a key tied to one account, with per-payment and daily limits. The limit is checked and used up in the same transaction as the payment, so 50 agents racing for the last of a budget cannot overspend it. Anything over a limit waits for the customer's approval, and revoking is immediate.
+- **The database refuses bad money states, even if the code is wrong.** Every transaction's debits must equal its credits within each currency; history is append-only; balances can never go negative. These are PostgreSQL constraints and triggers, not application checks.
 - **Every request is safe to retry.** Idempotency keys make each payment happen exactly once, even when the server stops between posting and answering.
 - **History cannot be quietly rewritten.** The app connects as a database role that can add to the ledger but cannot update, delete or disable the triggers that protect it. Committed transactions are sealed into a SHA-256 hash chain, and each seal is signed with an Ed25519 key the database never holds, so even someone with full database access who rewrites the whole chain is caught.
-- **It is tested like infrastructure.** Seeded simulations replay the whole bank, agents included, with crashes and lost responses injected, against an independent model; thousands of concurrent operations; network cuts and `SIGKILL`s of PostgreSQL under load; and reconciliation of every invariant after every test.
+- **It is tested like infrastructure.** Seeded simulations replay the whole bank with crashes and lost responses injected, against an independent model; thousands of concurrent operations; network cuts and `SIGKILL`s of PostgreSQL under load; and reconciliation of every invariant after every test.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     UI["React app<br/>(customers)"] -- "JWT" --> API
-    Agent["Claude agent"] -- "MCP tools" --> MCP["MCP server"]
-    MCP -- "Agent key" --> API
     API["Spring Boot API<br/>auth · idempotency · rate limits"] --> Engine["Posting engine<br/>group commit · locks last, in UUID order"]
     Engine --> DB[("PostgreSQL 17<br/>double-entry ledger<br/>constraints + triggers")]
     DB --> Outbox["Transactional outbox"] --> Hooks["Signed webhooks"]
@@ -34,10 +27,10 @@ flowchart LR
 
 | What | Result | Source |
 | --- | --- | --- |
-| 50 simultaneous agent payments of 3.00 against a 100.00 daily limit | Exactly 33 post (99.00), 17 are refused, every run | [`AgentMandateTest`](backend/src/test/java/com/smartbank/agent/AgentMandateTest.java) |
+| 100 identical transfers fired at once with one idempotency key | Posted exactly once; every caller gets the same transaction | [`ConcurrencyIntegrationTest`](backend/src/test/java/com/smartbank/transaction/ConcurrencyIntegrationTest.java) |
 | 5,000 random concurrent transfers (32 threads) | Money conserved, no negative balance, no deadlock, ledger reconciles | [`ConcurrencyIntegrationTest`](backend/src/test/java/com/smartbank/transaction/ConcurrencyIntegrationTest.java) |
 | PostgreSQL killed with `SIGKILL` twice under load | Every acknowledged transfer survives, nothing posts twice | [fault testing](docs/fault-testing.md) |
-| 40 seeded simulations of the bank, agents included, with crashes before commit and lost responses injected | Every step matches an independent model, nothing happens twice, a seed replays identically, and failures shrink to a few steps | [`LedgerSimulationTest`](backend/src/test/java/com/smartbank/fault/LedgerSimulationTest.java) |
+| 40 seeded simulations of the bank, with crashes before commit and lost responses injected | Every step matches an independent model, nothing happens twice, a seed replays identically, and failures shrink to a few steps | [`LedgerSimulationTest`](backend/src/test/java/com/smartbank/fault/LedgerSimulationTest.java) |
 | A transfer, its entries and both balances altered consistently | Missed by every balance check, caught by the hash chain | [`LedgerSealTest`](backend/src/test/java/com/smartbank/ledger/LedgerSealTest.java) |
 | The whole chain rewritten by someone with full database access | Caught by seal signatures, with no external record | [`SealSignatureTest`](backend/src/test/java/com/smartbank/ledger/SealSignatureTest.java) |
 | The app's own database role tries to update, delete, truncate or disable triggers on history | All 17 attempts refused, while every operation still works | [`AppRoleTest`](backend/src/test/java/com/smartbank/security/AppRoleTest.java) |
@@ -46,36 +39,34 @@ flowchart LR
 
 The test suite has over 200 tests; [docs/testing.md](docs/testing.md) lists what each group proves.
 
-## An agent paying, in short
+## A transfer, in short
 
 ```
-Customer:  POST /api/v1/mandates  { accountId, perPaymentLimit: "50.00", dailyLimit: "120.00", allowedPayeeAccountNumbers: ["DEMO-10002"] }
-           → apiKey "sbk_agent_…" (shown once)
+POST /api/v1/transfers   Idempotency-Key: 7f3c…   { fromAccountId: A, toAccountId: B, amount: "100.00" }
+  → 201 TRANSFER
+     ledger:  DR customer A 100.00 · CR customer B 100.00   (balanced and append-only, checked by the database)
+     outbox:  transaction.posted, committed with the transfer, then delivered as a signed webhook
+     seal:    covered by the next signed hash-chain seal
 
-Agent:     POST /api/v1/agent/payments   Authorization: Agent sbk_agent_…   Idempotency-Key: order-1
-           { toAccountNumber: "DEMO-10002", amount: "45.00", intent: "Wireless headphones" }   → POSTED
-           { …, amount: "180.00", intent: "27-inch monitor" }                                  → PENDING_APPROVAL
-
-Customer:  POST /api/v1/agent-payments/{id}/approve   → APPROVED, money moves
+Same request, same key      → 201, byte-identical body, Idempotent-Replayed: true; nothing moves twice
+Same key, different request → 422
 ```
 
-Try it with Claude: [agent-demo](agent-demo/) is an MCP server exposing this API as tools, and a script in which Claude shops through it. The frontend's **AI agents** page creates mandates, shows each agent's spending, and approves, declines or revokes.
+The frontend covers accounts, history, deposits, withdrawals, transfers by account number, and holds (place, capture in full or in part, release).
 
 ## Features
 
 - **Ledger:** double-entry with a chart of accounts and per-currency trial balances; balance checkpoints and statements; multi-currency with quoted FX; reversals that never edit history; a signed hash chain over all history.
 - **Money movement:** deposits, withdrawals and transfers; two-phase transfers (holds) with capture, release and expiry; linked transfers that post all or nothing; batched posting (group commit).
-- **AI agents:** spending mandates with per-payment and daily limits, allowed payees, owner approval above limits, immediate revocation and a full audit trail; an MCP server.
 - **Reliability:** idempotency keys scoped per user; short, deadlock-free locking; a transactional outbox with signed, retried webhooks; reconciliation of every invariant.
-- **Security:** the app runs as a database role that cannot rewrite history; JWT and BCrypt; ownership checks on every account; per-user, per-agent and per-IP rate limits in PostgreSQL; SSRF-guarded webhooks with encrypted, rotatable secrets.
+- **Security:** the app runs as a database role that cannot rewrite history; JWT and BCrypt; ownership checks on every account; per-user and per-IP rate limits in PostgreSQL; SSRF-guarded webhooks with encrypted, rotatable secrets.
 
 ## Documentation
 
-- [How SmartBank works](docs/design.md): the ledger, FX, agent spending, tamper evidence, checkpoints, holds, linked transfers and idempotency, in detail
+- [How SmartBank works](docs/design.md): the ledger, FX, tamper evidence, the database role, checkpoints, holds, linked transfers and idempotency, in detail
 - [Testing](docs/testing.md): what every test group proves, and how to run them
 - [API reference](docs/api.md)
 - [Benchmarks](docs/benchmarks.md), [fault testing](docs/fault-testing.md), [webhooks](docs/webhooks.md)
-- [Agent demo](agent-demo/README.md)
 
 ## Tech stack
 
@@ -112,8 +103,7 @@ Run the tests with `cd backend && mvn test` (JDK 21), or entirely in Docker as d
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/ratelimit`: token-bucket limiter, limits, filter
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `agent-demo`: MCP server for agent payments, and a Claude agent demo (TypeScript)
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator, V14 balance checkpoints, V15 multi-currency and FX, V16 agent mandates)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator, V14 balance checkpoints, V15 multi-currency and FX, V16 app database role, V17 signed seals)
 - `backend/src/test`: unit, integration, concurrency, simulation and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `docs`: design, testing, API, benchmarks and fault testing

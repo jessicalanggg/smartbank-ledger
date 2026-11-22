@@ -7,7 +7,6 @@ The design behind each part of the ledger. Start with the [README](../README.md)
 - [What it does](#what-it-does)
 - [How the ledger works](#how-the-ledger-works)
 - [How FX works](#how-fx-works)
-- [How agent spending works](#how-agent-spending-works)
 - [How tamper evidence works](#how-tamper-evidence-works)
 - [How the database protects history from the app](#how-the-database-protects-history-from-the-app)
 - [How balance checkpoints work](#how-balance-checkpoints-work)
@@ -26,7 +25,6 @@ The design behind each part of the ledger. Start with the [README](../README.md)
 - **Tamper-evident history and an audit trail.** Every transaction records who started it. A background job seals committed transactions into a SHA-256 hash chain (each seal covers its transactions, their entries and the previous seal), so any change to sealed history, even with the database's append-only triggers switched off, is detected. Each seal is signed with an Ed25519 key the database never holds, so even someone with full database access cannot rewrite the chain unnoticed. Reconciliation verifies the chain and its signatures on every run.
 - **Balance checkpoints and statements.** Each account's running debit and credit totals are checkpointed per day, so a balance at any moment is the latest checkpoint plus the few entries since. Customers get statements with an opening balance, every posting with a running balance, and a closing balance; the administrator trial balance reads through the same checkpoints. Reconciliation re-checks every checkpoint against the entries.
 - **Multi-currency with FX.** Accounts in CAD, USD, EUR, GBP or JPY, with amounts limited to each currency's decimals (no ¥10.5). Converting is quote-then-execute: a quote locks the rate and both amounts for 60 seconds and can be used once. An FX transfer is one transaction whose entries balance within each currency through per-currency FX position accounts, and the database rejects any transaction that does not.
-- **Spending mandates for AI agents.** A customer gives an agent an API key tied to one account, with a per-payment limit, a daily limit, an optional list of allowed payees and an expiry. Payments within the limits post at once; the limit is checked and used up by one conditional statement in the same transaction as the transfer, so 50 agents racing for the last of a daily budget can never overspend it, and a trigger re-checks the limit. Payments over a limit are rejected, or held until the owner approves or declines them. Revoking a mandate takes effect at once, even for payments already in flight. Every attempt is recorded, and every transfer an agent made names its mandate in the ledger and the hash chain.
 - **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
 - **Idempotency keys, scoped per user.** Every deposit, withdrawal, transfer and hold takes an `Idempotency-Key` header (or the `requestKey` body field). The first response, success or business error, is stored and replayed byte-for-byte for retries, marked `Idempotent-Replayed: true`, even when many retries arrive at once. Reusing a key for a different request returns 422. Keys are scoped to the calling user and expire after 24 hours. Posting stays exactly-once even if the server stops between posting and storing the response.
 - **Short, deadlock-free locking.** A transfer writes its transaction and ledger entries first, then updates both balances last with atomic statements in UUID order (the debit only succeeds if available funds cover it). Account locks are held only for those final statements and the commit, and opposing transfers (A→B and B→A) cannot deadlock.
@@ -37,7 +35,7 @@ The design behind each part of the ledger. Start with the [README](../README.md)
 - **Authentication and authorization.** Spring Security with stateless JWT (HS256, 30-minute expiry) and BCrypt password hashing. Users can only read, debit or view the history of accounts they own.
 - **The app cannot rewrite the books.** The running application connects as its own database role, which owns no table: it can add to the ledger but cannot update, delete, truncate, alter or disable the triggers on history.
 - **Database-enforced invariants.** Flyway migrations define `CHECK (balance >= 0)`, positive amounts, valid transaction shapes, a `UNIQUE` request key, balanced ledger postings and append-only history, so the database rejects bad states even if application code is wrong.
-- **React frontend** with login, accounts (with available balance and pending amounts), history, deposits, withdrawals, transfers by account number, and holds: place a hold by account number, then capture incoming holds in full or in part, or release them. An **AI agents** page gives an agent a mandate (limits, allowed payees, expiry; the key is shown once), shows each agent's spending today against its daily limit and its full activity, lets the customer approve or decline payments that went over a limit, and revokes agents. Every money-moving action retries safely with the same idempotency key.
+- **React frontend** with login, accounts (with available balance and pending amounts), history, deposits, withdrawals, transfers by account number, and holds: place a hold by account number, then capture incoming holds in full or in part, or release them. Every money-moving action retries safely with the same idempotency key.
 
 ## How the ledger works
 
@@ -86,27 +84,6 @@ POST /fx/transfers { quoteId }   (with an Idempotency-Key)
 - **Ledger:** one transaction with four entries, balancing within each currency through that currency's **3500 FX position** account. The database's balance check now works per currency and allows two currencies only for FX transfers. The FX positions hold the bank's net position per currency; valuing them in one reporting currency (FX gain or loss) is not implemented.
 - FX transfers are not batched and cannot be reversed yet.
 
-## How agent spending works
-
-```
-POST /mandates   { accountId, name: "Shopping agent", perPaymentLimit: "50.00", dailyLimit: "100.00",
-                   allowedPayeeAccountNumbers?: [...], expiresInDays?: 30, askAboveLimit?: true }
-  → { mandate: {...}, apiKey: "sbk_agent_…" }          (the key is shown once; only its SHA-256 is stored)
-
-The agent, with  Authorization: Agent sbk_agent_…  and an Idempotency-Key:
-POST /agent/payments { toAccountNumber, amount: "30.00", intent: "Buy headphones" }
-  → status POSTED             within both limits: paid now
-  → status PENDING_APPROVAL   over a limit: money held until the owner approves or declines
-  → status REJECTED           payee not allowed, over a limit when the mandate does not ask, or too many awaiting approval
-```
-
-- **The limit and the spend are one statement.** Each payment adds its amount to the mandate's usage for the day (UTC) with an upsert that only applies if the day stays within the daily limit, in the same transaction as the transfer. The upsert locks that day's usage row until commit, so simultaneous payments are counted one after another and can never exceed the limit together. If the transfer fails (for example insufficient funds), the usage rolls back with it. A database trigger also rejects any usage over the limit.
-- **Approval reuses holds.** A payment over a limit places a hold on the account, so the money is reserved and an approval cannot fail for lack of funds. Approving posts the hold, which counts against the day's usage; declining releases it; after 24 hours it expires. The payee cannot capture these holds the way it captures ordinary ones.
-- **Revocation is immediate.** Payments lock their mandate `FOR SHARE`, and revoking locks it exclusively, so it waits for payments in flight and no payment commits after it. Revoking also declines payments awaiting approval. A mandate's limits never change; to change them, revoke it and create another.
-- **Audit trail.** Every attempt, including rejected ones, is recorded with its intent and outcome. Transfers made by an agent carry `agentMandateId`, are initiated by the customer the agent acts for, and are covered by the hash chain. Reconciliation checks that each day's usage equals what was paid, that nothing paid without asking exceeded the limit, and that every agent payment matches its transfer.
-- **Demo with a real AI agent:** [agent-demo](../agent-demo/) is an MCP server exposing the agent API as tools (`get_spending_limits`, `pay`, `get_payment`, `list_payments`), and a script in which Claude shops through it: two purchases fit the limits and post, the third is over the per-payment limit and waits for the customer's approval.
-- Agent keys are rate-limited per mandate and work only on `/api/v1/agent/**`; customer tokens do not work there. Events `agent_payment.posted`, `.approval_requested`, `.approved`, `.declined` and `.rejected` go to the owner's webhooks.
-
 ## How tamper evidence works
 
 ```
@@ -125,19 +102,19 @@ seal 3: SHA-256(hash of seal 2, 3, transactions sealed in 3) ─┘  ledger entr
 
 ## How the database protects history from the app
 
-Migrations run as the schema owner. The running application connects as `smartbank_app` ([V17](../backend/src/main/resources/db/migration/V17__app_role.sql)), which owns nothing:
+Migrations run as the schema owner. The running application connects as `smartbank_app` ([V16](../backend/src/main/resources/db/migration/V16__app_role.sql)), which owns nothing:
 
 | Tables | The app may |
 | --- | --- |
-| Ledger history: transactions, ledger entries, outbox events, seals, checkpoints, FX rates, mandate payees, chart of accounts | `SELECT`, `INSERT` |
-| Live state: accounts, holds, FX quotes, agent mandates, usage and payments, webhook endpoints and deliveries | `SELECT`, `INSERT`, `UPDATE` (under each table's triggers) |
+| Ledger history: transactions, ledger entries, outbox events, seals, checkpoints, FX rates, chart of accounts | `SELECT`, `INSERT` |
+| Live state: accounts, holds, FX quotes, webhook endpoints and deliveries | `SELECT`, `INSERT`, `UPDATE` (under each table's triggers) |
 | Users | `SELECT`, `INSERT` |
 | Idempotency keys, rate-limit buckets | also `DELETE`, to prune expired rows |
 
 - Without ownership the app cannot `ALTER` a table, `DISABLE TRIGGER`, `DROP` or `TRUNCATE`, so the append-only triggers that refuse updates and deletes of history stay on. A bug or a compromised app server can add to the books but not rewrite them.
 - Reversals lock the original transaction (`FOR NO KEY UPDATE`), which PostgreSQL allows only with `UPDATE` on some column, so the app has `UPDATE` on one column of `banking_transactions`; its append-only trigger still rejects every update.
 - The role is created by the migration without a password; the app sets it after each migration from `smartbank.db.app-password` (`DB_APP_PASSWORD`), so no secret is stored in a migration. On a managed database, an administrator can create the role instead and leave that setting empty.
-- [`AppRoleTest`](../backend/src/test/java/com/smartbank/security/AppRoleTest.java) runs the application as this role through every operation (sign-up, deposits, transfers, linked transfers, holds and expiry, reversals, fees, FX, agent mandates and approvals, webhooks, statements, sealing, checkpoints, pruning, reconciliation), checks 17 forbidden statements are refused, and fails if a new table has no grants or one allows deletes.
+- [`AppRoleTest`](../backend/src/test/java/com/smartbank/security/AppRoleTest.java) runs the application as this role through every operation (sign-up, deposits, transfers, linked transfers, holds and expiry, reversals, fees, FX, webhooks, statements, sealing, checkpoints, pruning, reconciliation), checks 17 forbidden statements are refused, and fails if a new table has no grants or one allows deletes.
 
 ## How balance checkpoints work
 

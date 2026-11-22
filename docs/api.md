@@ -1,7 +1,7 @@
 # API reference
 
 
-All endpoints except health, login, register and the agent API need `Authorization: Bearer <token>`; the agent API (`/api/v1/agent/**`) needs `Authorization: Agent <key>` instead. Money-moving `POST`s (deposits, withdrawals, transfers, linked transfers, reversals, holds) also need an `Idempotency-Key` header, or a `requestKey` body field, of up to 255 characters.
+All endpoints except health, login and register need `Authorization: Bearer <token>`. Money-moving `POST`s (deposits, withdrawals, transfers, linked transfers, reversals, holds) also need an `Idempotency-Key` header, or a `requestKey` body field, of up to 255 characters.
 
 | Method | Path | Notes |
 | --- | --- | --- |
@@ -36,18 +36,6 @@ All endpoints except health, login, register and the agent API need `Authorizati
 | `POST` | `/api/v1/holds/{id}/void` | Payee only |
 | `GET` | `/api/v1/accounts/{id}/statement` | `?from=&to=` (ISO times, default the last 30 days, at most 366): opening balance, postings with running balance, closing balance. Owner only |
 | `GET` | `/api/v1/accounts/{id}/holds` | Holds in or out of the account, newest 100, owner only |
-| `POST` | `/api/v1/mandates` | `{ "accountId", "name", "perPaymentLimit", "dailyLimit", "allowedPayeeAccountNumbers"?, "expiresInDays"?, "askAboveLimit"? }`. Returns the agent's API key once. Owner of the account only |
-| `GET` | `/api/v1/mandates` | The caller's mandates, with today's spending |
-| `GET` | `/api/v1/mandates/{id}` | One mandate. Owner only |
-| `POST` | `/api/v1/mandates/{id}/revoke` | Immediate; declines payments awaiting approval |
-| `GET` | `/api/v1/mandates/{id}/payments` | Everything the agent attempted, newest 100 |
-| `GET` | `/api/v1/agent-payments/awaiting-approval` | The caller's payments over a limit waiting for a decision |
-| `GET` | `/api/v1/agent-payments/{id}` | One agent payment. Owner only |
-| `POST` | `/api/v1/agent-payments/{id}/approve` | Pays the held money |
-| `POST` | `/api/v1/agent-payments/{id}/decline` | Releases the held money |
-| `GET` | `/api/v1/agent/mandate` | Agent key only: its limits and what is left today |
-| `POST` | `/api/v1/agent/payments` | Agent key only: `{ "toAccountNumber", "amount", "intent" }` plus `Idempotency-Key`; 201 with status `POSTED`, `PENDING_APPROVAL` or `REJECTED` |
-| `GET` | `/api/v1/agent/payments`, `/api/v1/agent/payments/{id}` | Agent key only: its own payments |
 | `POST` | `/api/v1/webhook-endpoints` | `{ "url", "eventTypes"? }`. Returns the signing secret once |
 | `GET` | `/api/v1/webhook-endpoints` | The caller's endpoints |
 | `DELETE` | `/api/v1/webhook-endpoints/{id}` | Deactivate |
