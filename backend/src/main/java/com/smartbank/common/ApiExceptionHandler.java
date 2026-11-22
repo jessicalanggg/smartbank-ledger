@@ -6,6 +6,7 @@ import org.springframework.security.authentication.BadCredentialsException;
 import com.smartbank.transaction.BankingException;
 import com.smartbank.transaction.HoldNotFoundException;
 import com.smartbank.transaction.TransactionNotFoundException;
+import com.smartbank.transaction.FxQuoteNotFoundException;
 import com.smartbank.ratelimit.RateLimitedException;
 import org.springframework.http.ResponseEntity;
 import com.smartbank.idempotency.IdempotencyKeyMismatchException;
@@ -53,6 +54,10 @@ public class ApiExceptionHandler {
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                 .header("Retry-After", String.valueOf(ex.retryAfterSeconds()))
                 .body(problem(HttpStatus.TOO_MANY_REQUESTS, "Too many requests", ex.getMessage()));
+    }
+    @ExceptionHandler(FxQuoteNotFoundException.class)
+    public ProblemDetail fxQuoteNotFound(FxQuoteNotFoundException ex) {
+        return problem(HttpStatus.NOT_FOUND, "FX quote not found", ex.getMessage());
     }
     @ExceptionHandler(TransactionNotFoundException.class)
     public ProblemDetail transactionNotFound(TransactionNotFoundException ex) {

@@ -1,6 +1,7 @@
 package com.smartbank.transaction;
 
 import com.smartbank.account.*;
+import com.smartbank.common.Currencies;
 import com.smartbank.common.Initiator;
 import com.smartbank.common.UuidOrder;
 import com.smartbank.ledger.LedgerAccount;
@@ -32,13 +33,18 @@ public class BankingService {
     private final BankingTransactionRepository transactions;
     private final TransactionTemplate transactionTemplate;
     private final PostingWriter writer;
+    private final Currencies currencies;
+    private final org.springframework.jdbc.core.JdbcTemplate jdbc;
 
     public BankingService(AccountRepository accounts, BankingTransactionRepository transactions,
-            TransactionTemplate transactionTemplate, PostingWriter writer) {
+            TransactionTemplate transactionTemplate, PostingWriter writer, Currencies currencies,
+            org.springframework.jdbc.core.JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
         this.accounts = accounts;
         this.transactions = transactions;
         this.transactionTemplate = transactionTemplate;
         this.writer = writer;
+        this.currencies = currencies;
     }
 
     /*
@@ -201,6 +207,7 @@ public class BankingService {
             if (target == null) throw new AccountNotFoundException(leg.toAccountId());
             if (!source.getCurrency().equals(target.getCurrency()))
                 throw new BankingException("Transfer " + i + ": cross-currency transfers are not supported");
+            currencies.requireValidAmount(leg.amount(), source.getCurrency());
             net.merge(leg.fromAccountId(), leg.amount().negate(), BigDecimal::add);
             net.merge(leg.toAccountId(), leg.amount(), BigDecimal::add);
             rows.add(BankingTransaction.linkedLeg(linkId, i, leg.fromAccountId(), leg.toAccountId(),
@@ -297,6 +304,60 @@ public class BankingService {
         return TransactionResponse.from(prior);
     }
 
+    /**
+     * Executes an FX quote: sells the quote's amount from the payer's account and buys
+     * the quoted amount into the payee's, at the locked rate. The quote is locked and
+     * marked used in the same transaction, so it can be used only once.
+     */
+    public TransactionResponse fxTransfer(UUID quoteId, UUID userId, String requestKey) {
+        requireKey(requestKey);
+        return idempotent(requestKey, prior -> replayFx(prior, quoteId), () -> postFx(quoteId, userId, requestKey));
+    }
+
+    private TransactionResponse postFx(UUID quoteId, UUID userId, String key) {
+        var quote = jdbc.query("""
+                SELECT user_id, from_account_id, to_account_id, sell_amount, sell_currency, buy_amount, buy_currency, rate,
+                       expires_at, used_by_transaction_id
+                FROM fx_quotes WHERE id = ? FOR UPDATE""",
+                (rs, n) -> new Object[] { rs.getObject(1, UUID.class), rs.getObject(2, UUID.class), rs.getObject(3, UUID.class),
+                        rs.getBigDecimal(4), rs.getString(5), rs.getBigDecimal(6), rs.getString(7), rs.getBigDecimal(8),
+                        rs.getTimestamp(9).toInstant(), rs.getObject(10, UUID.class) }, quoteId);
+        if (quote.isEmpty() || !quote.get(0)[0].equals(userId)) throw new FxQuoteNotFoundException(quoteId);
+        Object[] q = quote.get(0);
+        // A simultaneous identical request may have used the quote while we waited for its lock.
+        var previous = transactions.findByRequestKey(key);
+        if (previous.isPresent()) return replayFx(previous.get(), quoteId);
+        if (q[9] != null) throw new BankingException("This quote was already used");
+        if (!java.time.Instant.now().isBefore((java.time.Instant) q[8])) throw new BankingException("This quote has expired");
+        UUID from = (UUID) q[1], to = (UUID) q[2];
+        BigDecimal sell = (BigDecimal) q[3], buy = (BigDecimal) q[5];
+        Map<UUID, Account> found = new HashMap<>();
+        accounts.findAllById(List.of(from, to)).forEach(a -> found.put(a.getId(), a));
+        Account source = found.get(from), target = found.get(to);
+        if (source == null) throw new AccountNotFoundException(from);
+        if (target == null) throw new AccountNotFoundException(to);
+        if (!source.getCurrency().equals(q[4]) || !target.getCurrency().equals(q[6]))
+            throw new BankingException("The accounts' currencies changed since the quote");
+        failFastIfUnavailable(source, sell);
+        BankingTransaction tx = BankingTransaction.fxTransfer(from, to, sell, (String) q[4], buy, (String) q[6],
+                (BigDecimal) q[7], quoteId, key).initiatedBy(Initiator.current());
+        TransactionResponse response = writer.post(tx);
+        jdbc.update("UPDATE fx_quotes SET used_by_transaction_id = ? WHERE id = ?", tx.getId(), quoteId);
+        // Critical section last: the payer's debit and the payee's credit, in the shared lock order.
+        var debit = new PostingWriter.BalanceChange(from, sell.negate());
+        var credit = new PostingWriter.BalanceChange(to, buy);
+        boolean debitFirst = UuidOrder.before(from, to);
+        boolean[] applied = writer.applyBalanceChanges(debitFirst ? List.of(debit, credit) : List.of(credit, debit));
+        if (!applied[debitFirst ? 0 : 1]) throw new BankingException("Insufficient funds");
+        return response;
+    }
+
+    private TransactionResponse replayFx(BankingTransaction prior, UUID quoteId) {
+        if (prior.getTransactionType() != TransactionType.FX_TRANSFER || !quoteId.equals(prior.getFxQuoteId()))
+            throw new BankingException("Request key was already used for a different operation");
+        return TransactionResponse.from(prior);
+    }
+
     private TransactionResponse idempotent(String requestKey,
             Function<BankingTransaction, TransactionResponse> replay,
             Supplier<TransactionResponse> post) {
@@ -327,6 +388,7 @@ public class BankingService {
     private TransactionResponse postSingleAccount(TransactionType type, UUID accountId, MoneyRequest request) {
         Account account = accounts.findById(accountId).orElseThrow(() -> new AccountNotFoundException(accountId));
         BigDecimal amount = request.amount();
+        currencies.requireValidAmount(amount, account.getCurrency());
         if (type == TransactionType.DEPOSIT) {
             TransactionResponse tx = record(type, null, accountId, amount, account.getCurrency(), request.requestKey());
             writer.applyBalanceChanges(List.of(new PostingWriter.BalanceChange(accountId, amount)));
@@ -350,6 +412,7 @@ public class BankingService {
         if (target == null) throw new AccountNotFoundException(to);
         if (!source.getCurrency().equals(target.getCurrency()))
             throw new BankingException("Cross-currency transfers are not supported");
+        currencies.requireValidAmount(amount, source.getCurrency());
         failFastIfUnavailable(source, amount);
         TransactionResponse tx = record(TransactionType.TRANSFER, from, to, amount, source.getCurrency(),
                 request.requestKey());
@@ -430,6 +493,12 @@ public class BankingService {
             case OPENING_BALANCE -> List.of(
                     LedgerEntry.internal(id, LedgerAccount.OPENING_EQUITY, amount.negate(), currency, at),
                     LedgerEntry.customer(id, tx.getDestinationAccountId(), amount, currency, at));
+            // An FX transfer balances within each currency through that currency's FX position.
+            case FX_TRANSFER -> List.of(
+                    LedgerEntry.customer(id, tx.getSourceAccountId(), amount.negate(), currency, at),
+                    LedgerEntry.internal(id, LedgerAccount.FX_POSITION, amount, currency, at),
+                    LedgerEntry.internal(id, LedgerAccount.FX_POSITION, tx.getCounterAmount().negate(), tx.getCounterCurrency(), at),
+                    LedgerEntry.customer(id, tx.getDestinationAccountId(), tx.getCounterAmount(), tx.getCounterCurrency(), at));
             // A fee: debit the customer, credit fee revenue.
             case FEE -> List.of(
                     LedgerEntry.customer(id, tx.getSourceAccountId(), amount.negate(), currency, at),

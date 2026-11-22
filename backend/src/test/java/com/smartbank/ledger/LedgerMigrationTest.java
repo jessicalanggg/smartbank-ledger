@@ -42,8 +42,9 @@ class LedgerMigrationTest {
 
         var report = new LedgerReconciliation(jdbc).run();
         assertTrue(report.isClean(), () -> "Ledger out of balance after migration: " + report);
-        assertEquals(10, jdbc.queryForObject("SELECT COUNT(*) FROM ledger_entries", Integer.class),
-                "Two entries for each of the 3 transactions and 2 opening balances");
+        assertEquals(12, jdbc.queryForObject("SELECT COUNT(*) FROM ledger_entries", Integer.class),
+                "Two entries for each of the 3 transactions, the 2 backfilled opening balances, "
+                        + "and the USD demo account's opening balance added in V15");
         assertMoney("1250.00", opening(jdbc, A));
         assertMoney("3800.50", opening(jdbc, B));
         assertTrue(jdbc.queryForObject("""

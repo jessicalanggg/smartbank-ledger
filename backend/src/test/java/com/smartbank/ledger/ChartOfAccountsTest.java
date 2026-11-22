@@ -90,7 +90,8 @@ class ChartOfAccountsTest {
         assertEquals("CREDIT", row.get("normal_balance"));
         assertEquals("2000", row.get("parent"));
         // The system accounts for the currency exist, each with the normal side its type implies.
-        assertEquals(List.of("1000 ASSET DEBIT", "2000 LIABILITY CREDIT", "3900 EQUITY CREDIT", "4000 REVENUE CREDIT"),
+        assertEquals(List.of("1000 ASSET DEBIT", "2000 LIABILITY CREDIT", "3500 EQUITY CREDIT", "3900 EQUITY CREDIT",
+                        "4000 REVENUE CREDIT"),
                 jdbc.queryForList("""
                         SELECT code || ' ' || account_type || ' ' || normal_balance FROM ledger_accounts
                         WHERE currency = 'CAD' AND customer_account_id IS NULL ORDER BY code""", String.class));

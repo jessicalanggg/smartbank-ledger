@@ -110,6 +110,7 @@ public class PostingBatcher {
     private final BankingTransactionRepository transactions;
     private final PostingWriter writer;
     private final TransactionTemplate transactionTemplate;
+    private final com.smartbank.common.Currencies currencies;
     private final BlockingQueue<Pending> queue = new LinkedBlockingQueue<>();
     private final List<Thread> workers = new ArrayList<>();
     private final int maxBatch;
@@ -121,7 +122,7 @@ public class PostingBatcher {
 
     public PostingBatcher(BankingService banking, AccountRepository accounts,
                            BankingTransactionRepository transactions, PostingWriter writer,
-                           TransactionTemplate transactionTemplate,
+                           TransactionTemplate transactionTemplate, com.smartbank.common.Currencies currencies,
                            @Value("${smartbank.batching.workers:2}") int workerCount,
                            @Value("${smartbank.batching.max-size:200}") int maxBatch,
                            @Value("${smartbank.batching.linger:0ms}") Duration linger,
@@ -131,6 +132,7 @@ public class PostingBatcher {
         this.transactions = transactions;
         this.writer = writer;
         this.transactionTemplate = transactionTemplate;
+        this.currencies = currencies;
         this.maxBatch = maxBatch;
         this.lingerNanos = linger.toNanos();
         this.callerTimeout = callerTimeout;
@@ -354,13 +356,18 @@ public class PostingBatcher {
     }
 
     /** Why the posting cannot be accepted given the balances so far, or null if it can. */
-    private static RuntimeException check(Posting r, Map<UUID, Account> locked, Map<UUID, BigDecimal> available) {
+    private RuntimeException check(Posting r, Map<UUID, Account> locked, Map<UUID, BigDecimal> available) {
         Account source = r.from() == null ? null : locked.get(r.from());
         Account target = r.to() == null ? null : locked.get(r.to());
         if (r.from() != null && source == null) return new AccountNotFoundException(r.from());
         if (r.to() != null && target == null) return new AccountNotFoundException(r.to());
         if (source != null && target != null && !source.getCurrency().equals(target.getCurrency()))
             return new BankingException("Cross-currency transfers are not supported");
+        try {
+            currencies.requireValidAmount(r.amount(), (source != null ? source : target).getCurrency());
+        } catch (BankingException e) {
+            return e;
+        }
         if (source != null && available.get(r.from()).compareTo(r.amount()) < 0)
             return new BankingException("Insufficient funds");
         return null;
@@ -372,7 +379,7 @@ public class PostingBatcher {
      * cover its net change across the group. Same checks, in the same order, as the
      * unbatched path, so the error is the same.
      */
-    private static RuntimeException checkLinked(Posting r, Map<UUID, Account> locked, Map<UUID, BigDecimal> available) {
+    private RuntimeException checkLinked(Posting r, Map<UUID, Account> locked, Map<UUID, BigDecimal> available) {
         Map<UUID, BigDecimal> groupNet = new TreeMap<>(UuidOrder.COMPARATOR);
         for (int i = 0; i < r.legs().size(); i++) {
             var leg = r.legs().get(i);
@@ -381,6 +388,11 @@ public class PostingBatcher {
             if (target == null) return new AccountNotFoundException(leg.toAccountId());
             if (!source.getCurrency().equals(target.getCurrency()))
                 return new BankingException("Transfer " + i + ": cross-currency transfers are not supported");
+            try {
+                currencies.requireValidAmount(leg.amount(), source.getCurrency());
+            } catch (BankingException e) {
+                return e;
+            }
             groupNet.merge(leg.fromAccountId(), leg.amount().negate(), BigDecimal::add);
             groupNet.merge(leg.toAccountId(), leg.amount(), BigDecimal::add);
         }

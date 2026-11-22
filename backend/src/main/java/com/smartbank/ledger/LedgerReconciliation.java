@@ -53,10 +53,16 @@ public class LedgerReconciliation {
     public Report run() {
         BigDecimal total = jdbc.queryForObject(
                 "SELECT COALESCE(SUM(amount), 0) FROM ledger_entries", BigDecimal.class);
+        // Each transaction balances within each of its currencies, and uses one currency,
+        // or two for an FX transfer.
         Integer unbalanced = jdbc.queryForObject("""
                 SELECT COUNT(*) FROM (
-                    SELECT transaction_id FROM ledger_entries GROUP BY transaction_id
-                    HAVING SUM(amount) <> 0 OR COUNT(*) < 2 OR COUNT(DISTINCT currency) <> 1
+                    SELECT l.transaction_id FROM ledger_entries l JOIN banking_transactions t ON t.id = l.transaction_id
+                    GROUP BY l.transaction_id, t.transaction_type
+                    HAVING COUNT(*) < 2
+                        OR COUNT(DISTINCT l.currency) <> CASE WHEN t.transaction_type = 'FX_TRANSFER' THEN 2 ELSE 1 END
+                    UNION
+                    SELECT transaction_id FROM ledger_entries GROUP BY transaction_id, currency HAVING SUM(amount) <> 0
                 ) t""", Integer.class);
         Integer withoutEntries = jdbc.queryForObject("""
                 SELECT COUNT(*) FROM banking_transactions t

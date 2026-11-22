@@ -52,9 +52,12 @@ public class HoldService {
     private final OutboxWriter outbox;
     private final TransactionTemplate transactionTemplate;
     private final Clock clock;
+    private final com.smartbank.common.Currencies currencies;
 
     public HoldService(HoldRepository holds, BankingService banking, AccountRepository accounts, PostingWriter writer,
-                       OutboxWriter outbox, TransactionTemplate transactionTemplate, Clock clock) {
+                       OutboxWriter outbox, TransactionTemplate transactionTemplate, Clock clock,
+                       com.smartbank.common.Currencies currencies) {
+        this.currencies = currencies;
         this.holds = holds;
         this.banking = banking;
         this.accounts = accounts;
@@ -102,6 +105,7 @@ public class HoldService {
         if (target == null) throw new AccountNotFoundException(to);
         if (!source.getCurrency().equals(target.getCurrency()))
             throw new BankingException("Cross-currency holds are not supported");
+        currencies.requireValidAmount(request.amount(), source.getCurrency());
         if (source.getAvailableBalance().compareTo(request.amount()) < 0)
             throw new BankingException("Insufficient funds");  // fast fail on an unlocked read
         Instant now = now();

@@ -20,6 +20,8 @@ public class DemoUserBootstrap {
             transactionTemplate.executeWithoutResult(status -> {
                 create(users, accounts, encoder, "demo.a@smartbank.local", password,
                         "11111111-1111-4111-8111-111111111111");
+                create(users, accounts, encoder, "demo.a@smartbank.local", password,
+                        "33333333-3333-4333-8333-333333333333");  // USD account, for FX
                 create(users, accounts, encoder, "demo.b@smartbank.local", password,
                         "22222222-2222-4222-8222-222222222222");
             });

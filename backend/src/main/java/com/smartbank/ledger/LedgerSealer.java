@@ -160,15 +160,21 @@ public class LedgerSealer {
         Map<UUID, String> tx = new HashMap<>();
         jdbc.query("""
                 SELECT id, transaction_type, source_account_id, destination_account_id, amount, currency, request_key,
-                       created_at, link_id, link_index, reverses_transaction_id, initiated_by
+                       created_at, link_id, link_index, reverses_transaction_id, initiated_by,
+                       counter_amount, counter_currency, fx_rate, fx_quote_id
                 FROM banking_transactions WHERE id = ANY (?)""",
                 rs -> {
-                    tx.put(rs.getObject("id", UUID.class), String.join("|",
+                    // FX fields are appended only when present, so transactions sealed before
+                    // they existed keep the exact text, and hash, they were sealed with.
+                    String fx = rs.getBigDecimal("counter_amount") == null ? "" : "|fx:" + String.join(",",
+                            money(rs.getBigDecimal("counter_amount")), rs.getString("counter_currency"),
+                            rs.getBigDecimal("fx_rate").toPlainString(), rs.getString("fx_quote_id"));
+                    tx.put(rs.getObject("id", UUID.class), fx(String.join("|",
                             rs.getString("id"), rs.getString("transaction_type"), text(rs.getString("source_account_id")),
                             text(rs.getString("destination_account_id")), money(rs.getBigDecimal("amount")),
                             rs.getString("currency"), text(rs.getString("request_key")), micros(rs.getTimestamp("created_at")),
                             text(rs.getString("link_id")), text(rs.getString("link_index")),
-                            text(rs.getString("reverses_transaction_id")), text(rs.getString("initiated_by"))));
+                            text(rs.getString("reverses_transaction_id")), text(rs.getString("initiated_by"))), fx));
                 },
                 (Object) ids.toArray(new UUID[0]));
         Map<UUID, List<String>> entries = new HashMap<>();
@@ -203,6 +209,7 @@ public class LedgerSealer {
     }
 
     private static String text(String value) { return value == null ? "-" : value; }
+    private static String fx(String base, String fx) { return base + fx; }
     private static String money(BigDecimal value) { return value.setScale(2, RoundingMode.UNNECESSARY).toPlainString(); }
     private static String micros(Timestamp t) {
         Instant i = t.toInstant();

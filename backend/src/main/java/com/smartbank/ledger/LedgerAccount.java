@@ -16,5 +16,7 @@ public enum LedgerAccount {
     /** Balances that existed before the ledger was introduced: equity (3900). */
     OPENING_EQUITY,
     /** Fees charged to customers: revenue (4000). */
-    FEE_REVENUE
+    FEE_REVENUE,
+    /** The bank's net position in a currency from FX conversions: equity (3500). */
+    FX_POSITION
 }

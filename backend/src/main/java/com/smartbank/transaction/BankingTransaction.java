@@ -25,6 +25,11 @@ public class BankingTransaction {
     @Column(name = "reverses_transaction_id", updatable = false) private UUID reversesTransactionId;
     /** The user whose request created this transaction; null for the system. */
     @Column(name = "initiated_by", updatable = false) private UUID initiatedBy;
+    /** FX transfers only: the buy side, the rate applied and the quote used. */
+    @Column(name = "counter_amount", precision = 19, scale = 2, updatable = false) private BigDecimal counterAmount;
+    @Column(name = "counter_currency", length = 3, updatable = false) private String counterCurrency;
+    @Column(name = "fx_rate", precision = 20, scale = 10, updatable = false) private BigDecimal fxRate;
+    @Column(name = "fx_quote_id", updatable = false) private UUID fxQuoteId;
 
     protected BankingTransaction() { }
     public BankingTransaction(TransactionType type, UUID source, UUID destination,
@@ -67,6 +72,21 @@ public class BankingTransaction {
 
     public UUID getReversesTransactionId() { return reversesTransactionId; }
     public UUID getInitiatedBy() { return initiatedBy; }
+    public BigDecimal getCounterAmount() { return counterAmount; }
+    public String getCounterCurrency() { return counterCurrency; }
+    public BigDecimal getFxRate() { return fxRate; }
+    public UUID getFxQuoteId() { return fxQuoteId; }
+
+    /** An FX transfer: sell {@code amount} of {@code currency}, buy {@code counterAmount} of {@code counterCurrency}. */
+    static BankingTransaction fxTransfer(UUID from, UUID to, BigDecimal amount, String currency, BigDecimal counterAmount,
+                                         String counterCurrency, BigDecimal rate, UUID quoteId, String requestKey) {
+        BankingTransaction tx = new BankingTransaction(TransactionType.FX_TRANSFER, from, to, amount, currency, requestKey);
+        tx.counterAmount = counterAmount;
+        tx.counterCurrency = counterCurrency;
+        tx.fxRate = rate;
+        tx.fxQuoteId = quoteId;
+        return tx;
+    }
 
     /** Records who started the transaction; set before it is written. */
     BankingTransaction initiatedBy(UUID user) {

@@ -21,7 +21,8 @@ class BankingServiceTest {
     private final BankingTransactionRepository transactions = mock(BankingTransactionRepository.class);
     private final org.springframework.transaction.support.TransactionTemplate transactionTemplate = inlineTransactions();
     private final PostingWriter writer = mock(PostingWriter.class);
-    private final BankingService service = new BankingService(accounts, transactions, transactionTemplate, writer);
+    private final BankingService service = new BankingService(accounts, transactions, transactionTemplate, writer,
+        mock(com.smartbank.common.Currencies.class), mock(org.springframework.jdbc.core.JdbcTemplate.class));
     /** Balances the fake writer applies, keyed by account. */
     private final java.util.Map<UUID, Account> fixtures = new java.util.HashMap<>();
 

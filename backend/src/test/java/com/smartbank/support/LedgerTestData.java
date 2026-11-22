@@ -35,8 +35,18 @@ public final class LedgerTestData {
      * TRUNCATE bypasses the append-only and hold-transition triggers.
      */
     public static void truncateLedger(JdbcTemplate jdbc) {
-        jdbc.execute("TRUNCATE ledger_checkpoints, ledger_checkpoint_runs, ledger_sealed_transactions, ledger_seals, "
-                + "webhook_deliveries, outbox_events, holds, ledger_entries, banking_transactions");
+        // TRUNCATE locks these tables in one order while background jobs (such as the
+        // sealer) lock some of them in another, so PostgreSQL can pick the reset as a
+        // deadlock victim. The application never truncates; tests just retry.
+        for (int attempt = 1; ; attempt++) {
+            try {
+                jdbc.execute("TRUNCATE fx_quotes, ledger_checkpoints, ledger_checkpoint_runs, ledger_sealed_transactions, "
+                        + "ledger_seals, webhook_deliveries, outbox_events, holds, ledger_entries, banking_transactions");
+                break;
+            } catch (org.springframework.dao.ConcurrencyFailureException e) {
+                if (attempt == 5) throw e;
+            }
+        }
         jdbc.update("UPDATE accounts SET pending_debits = 0, pending_credits = 0");
     }
 
