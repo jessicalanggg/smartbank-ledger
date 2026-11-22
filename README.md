@@ -131,6 +131,7 @@ POST /agent/payments { toAccountNumber, amount: "30.00", intent: "Buy headphones
 - **Approval reuses holds.** A payment over a limit places a hold on the account, so the money is reserved and an approval cannot fail for lack of funds. Approving posts the hold, which counts against the day's usage; declining releases it; after 24 hours it expires. The payee cannot capture these holds the way it captures ordinary ones.
 - **Revocation is immediate.** Payments lock their mandate `FOR SHARE`, and revoking locks it exclusively, so it waits for payments in flight and no payment commits after it. Revoking also declines payments awaiting approval. A mandate's limits never change; to change them, revoke it and create another.
 - **Audit trail.** Every attempt, including rejected ones, is recorded with its intent and outcome. Transfers made by an agent carry `agentMandateId`, are initiated by the customer the agent acts for, and are covered by the hash chain. Reconciliation checks that each day's usage equals what was paid, that nothing paid without asking exceeded the limit, and that every agent payment matches its transfer.
+- **Demo with a real AI agent:** [agent-demo](agent-demo/) is an MCP server exposing the agent API as tools (`get_spending_limits`, `pay`, `get_payment`, `list_payments`), and a script in which Claude shops through it: two purchases fit the limits and post, the third is over the per-payment limit and waits for the customer's approval.
 - Agent keys are rate-limited per mandate and work only on `/api/v1/agent/**`; customer tokens do not work there. Events `agent_payment.posted`, `.approval_requested`, `.approved`, `.declined` and `.rejected` go to the owner's webhooks.
 
 ## How tamper evidence works
@@ -318,6 +319,7 @@ Sending the same command again with the same `$KEY` returns the identical respon
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/ratelimit`: token-bucket limiter, limits, filter
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
+- `agent-demo`: MCP server for agent payments, and a Claude agent demo (TypeScript)
 - `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator, V14 balance checkpoints, V15 multi-currency and FX, V16 agent mandates)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
