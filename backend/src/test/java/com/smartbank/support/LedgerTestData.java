@@ -40,7 +40,7 @@ public final class LedgerTestData {
         // deadlock victim. The application never truncates; tests just retry.
         for (int attempt = 1; ; attempt++) {
             try {
-                jdbc.execute("TRUNCATE agent_payments, agent_mandate_usage, fx_quotes, ledger_checkpoints, ledger_checkpoint_runs, ledger_sealed_transactions, "
+                jdbc.execute("TRUNCATE agent_payments, agent_mandate_usage, agent_mandate_payees, agent_mandates, fx_quotes, ledger_checkpoints, ledger_checkpoint_runs, ledger_sealed_transactions, "
                         + "ledger_seals, webhook_deliveries, outbox_events, holds, ledger_entries, banking_transactions");
                 break;
             } catch (org.springframework.dao.ConcurrencyFailureException e) {
