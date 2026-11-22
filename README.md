@@ -1,6 +1,6 @@
 # SmartBank
 
-A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuses on making money movement correct under retries and concurrency, and comes with a React frontend.
+A double-entry banking ledger built with Java 21, Spring Boot and PostgreSQL, which lets AI agents spend money within limits the database enforces. It focuses on making money movement correct under retries, concurrency and failures, and comes with a React frontend.
 
 **Educational simulation only.** All data is synthetic. Do not expose it to the internet or use real personal or financial data.
 
@@ -15,6 +15,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Tamper-evident history and an audit trail.** Every transaction records who started it. A background job seals committed transactions into a SHA-256 hash chain (each seal covers its transactions, their entries and the previous seal), so any change to sealed history, even with the database's append-only triggers switched off, is detected. Reconciliation verifies the chain on every run.
 - **Balance checkpoints and statements.** Each account's running debit and credit totals are checkpointed per day, so a balance at any moment is the latest checkpoint plus the few entries since. Customers get statements with an opening balance, every posting with a running balance, and a closing balance; the administrator trial balance reads through the same checkpoints. Reconciliation re-checks every checkpoint against the entries.
 - **Multi-currency with FX.** Accounts in CAD, USD, EUR, GBP or JPY, with amounts limited to each currency's decimals (no ¥10.5). Converting is quote-then-execute: a quote locks the rate and both amounts for 60 seconds and can be used once. An FX transfer is one transaction whose entries balance within each currency through per-currency FX position accounts, and the database rejects any transaction that does not.
+- **Spending mandates for AI agents.** A customer gives an agent an API key tied to one account, with a per-payment limit, a daily limit, an optional list of allowed payees and an expiry. Payments within the limits post at once; the limit is checked and used up by one conditional statement in the same transaction as the transfer, so 50 agents racing for the last of a daily budget can never overspend it, and a trigger re-checks the limit. Payments over a limit are rejected, or held until the owner approves or declines them. Revoking a mandate takes effect at once, even for payments already in flight. Every attempt is recorded, and every transfer an agent made names its mandate in the ledger and the hash chain.
 - **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
 - **Idempotency keys, scoped per user.** Every deposit, withdrawal, transfer and hold takes an `Idempotency-Key` header (or the `requestKey` body field). The first response, success or business error, is stored and replayed byte-for-byte for retries, marked `Idempotent-Replayed: true`, even when many retries arrive at once. Reusing a key for a different request returns 422. Keys are scoped to the calling user and expire after 24 hours. Posting stays exactly-once even if the server stops between posting and storing the response.
 - **Short, deadlock-free locking.** A transfer writes its transaction and ledger entries first, then updates both balances last with atomic statements in UUID order (the debit only succeeds if available funds cover it). Account locks are held only for those final statements and the commit, and opposing transfers (A→B and B→A) cannot deadlock.
@@ -48,6 +49,7 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | Webhook tests (real HTTP receiver) | Events only for committed changes; routing to payer and payee only; signatures verify and reject tampering; retries on schedule; dead-lettering; timeouts; expired leases; 6 concurrent workers deliver 120 events exactly once |
 | Hold API tests (real JWT security) | Only the payer can place a hold, only the payee can post or void it, only the two parties can see it |
 | FX tests | A quote locks its rate even if the rate changes; execution posts four entries that balance within each currency, with balanced trial balances in both; rounding down to each currency's decimals (including JPY); quotes are single-use, expire and are private; paying another user's account; a failed execution leaves the quote usable; same-currency, missing-rate and plain cross-currency transfers rejected; JPY decimals rejected; rates are admin-only; 20 racing executions of one quote post once; the database rejects an FX transaction that does not balance per currency; FX details are covered by the hash chain |
+| Agent mandate tests | Payments within the limits post at once and the ledger names the mandate; over a limit, money is held until the owner approves (paid) or declines (released), and the payee cannot capture it; rejected when the mandate does not ask; payees outside the allowed list rejected and every attempt recorded; at most 5 payments await approval; 50 simultaneous payments against a 100.00 daily limit post exactly 33 × 3.00; revoking stops the key and a payment already past the key check, and declines what awaits approval; agent keys only work on the agent API; idempotent retries; the database refuses usage over the limit and any change to a mandate except revocation; reconciliation checks usage against payments after every test |
 | Checkpoint tests | Balances at many moments, through checkpoints, equal a full scan of the entries; the trial balance through checkpoints matches the entries; the job checkpoints each boundary once and only past the horizon; an entry committed after its checkpoint is reported; an altered checkpoint is reported; statements show opening, lines with running balance and closing, and are owner-only; database transactions are time-limited |
 | Hash-chain tests | Every committed transaction sealed once into one chain; a balanced change invisible to reconciliation (transaction, entries and balances all altered consistently) caught by the chain; changed details and deleted transactions caught; re-sealing a tampered seal breaks the next link, and a full rewrite is caught against an externally recorded head; concurrent sealers never fork the chain; initiators recorded and visible to administrators |
 | Chart of accounts tests | Every customer account gets its own liability account; each posting type produces the right debits and credits; the trial balance balances and satisfies the accounting equation, now and as of an earlier moment; fees need funds and are idempotent; the ledger API is admin-only; the database rejects an account whose normal side contradicts its type; reconciliation notices an entry with no chart account |
@@ -110,6 +112,26 @@ POST /fx/transfers { quoteId }   (with an Idempotency-Key)
 - **Quotes** lock the rate and both amounts. The received amount is rounded down to the target currency's minor unit (JPY has none), and a quote can be executed once, by the user who got it, before it expires; the quote row is locked while it is used, so racing executions post once. A failed execution (for example insufficient funds) rolls back and leaves the quote usable.
 - **Ledger:** one transaction with four entries, balancing within each currency through that currency's **3500 FX position** account. The database's balance check now works per currency and allows two currencies only for FX transfers. The FX positions hold the bank's net position per currency; valuing them in one reporting currency (FX gain or loss) is not implemented.
 - FX transfers are not batched and cannot be reversed yet.
+
+## How agent spending works
+
+```
+POST /mandates   { accountId, name: "Shopping agent", perPaymentLimit: "50.00", dailyLimit: "100.00",
+                   allowedPayeeAccountNumbers?: [...], expiresInDays?: 30, askAboveLimit?: true }
+  → { mandate: {...}, apiKey: "sbk_agent_…" }          (the key is shown once; only its SHA-256 is stored)
+
+The agent, with  Authorization: Agent sbk_agent_…  and an Idempotency-Key:
+POST /agent/payments { toAccountNumber, amount: "30.00", intent: "Buy headphones" }
+  → status POSTED             within both limits: paid now
+  → status PENDING_APPROVAL   over a limit: money held until the owner approves or declines
+  → status REJECTED           payee not allowed, over a limit when the mandate does not ask, or too many awaiting approval
+```
+
+- **The limit and the spend are one statement.** Each payment adds its amount to the mandate's usage for the day (UTC) with an upsert that only applies if the day stays within the daily limit, in the same transaction as the transfer. The upsert locks that day's usage row until commit, so simultaneous payments are counted one after another and can never exceed the limit together. If the transfer fails (for example insufficient funds), the usage rolls back with it. A database trigger also rejects any usage over the limit.
+- **Approval reuses holds.** A payment over a limit places a hold on the account, so the money is reserved and an approval cannot fail for lack of funds. Approving posts the hold, which counts against the day's usage; declining releases it; after 24 hours it expires. The payee cannot capture these holds the way it captures ordinary ones.
+- **Revocation is immediate.** Payments lock their mandate `FOR SHARE`, and revoking locks it exclusively, so it waits for payments in flight and no payment commits after it. Revoking also declines payments awaiting approval. A mandate's limits never change; to change them, revoke it and create another.
+- **Audit trail.** Every attempt, including rejected ones, is recorded with its intent and outcome. Transfers made by an agent carry `agentMandateId`, are initiated by the customer the agent acts for, and are covered by the hash chain. Reconciliation checks that each day's usage equals what was paid, that nothing paid without asking exceeded the limit, and that every agent payment matches its transfer.
+- Agent keys are rate-limited per mandate and work only on `/api/v1/agent/**`; customer tokens do not work there. Events `agent_payment.posted`, `.approval_requested`, `.approved`, `.declined` and `.rejected` go to the owner's webhooks.
 
 ## How tamper evidence works
 
@@ -216,7 +238,7 @@ CI runs `mvn verify` on every push and pull request. The hot-account benchmark a
 
 ## API
 
-All endpoints except health, login and register need `Authorization: Bearer <token>`. Money-moving `POST`s (deposits, withdrawals, transfers, linked transfers, reversals, holds) also need an `Idempotency-Key` header, or a `requestKey` body field, of up to 255 characters.
+All endpoints except health, login, register and the agent API need `Authorization: Bearer <token>`; the agent API (`/api/v1/agent/**`) needs `Authorization: Agent <key>` instead. Money-moving `POST`s (deposits, withdrawals, transfers, linked transfers, reversals, holds) also need an `Idempotency-Key` header, or a `requestKey` body field, of up to 255 characters.
 
 | Method | Path | Notes |
 | --- | --- | --- |
@@ -250,6 +272,18 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `POST` | `/api/v1/holds/{id}/void` | Payee only |
 | `GET` | `/api/v1/accounts/{id}/statement` | `?from=&to=` (ISO times, default the last 30 days, at most 366): opening balance, postings with running balance, closing balance. Owner only |
 | `GET` | `/api/v1/accounts/{id}/holds` | Holds in or out of the account, newest 100, owner only |
+| `POST` | `/api/v1/mandates` | `{ "accountId", "name", "perPaymentLimit", "dailyLimit", "allowedPayeeAccountNumbers"?, "expiresInDays"?, "askAboveLimit"? }`. Returns the agent's API key once. Owner of the account only |
+| `GET` | `/api/v1/mandates` | The caller's mandates, with today's spending |
+| `GET` | `/api/v1/mandates/{id}` | One mandate. Owner only |
+| `POST` | `/api/v1/mandates/{id}/revoke` | Immediate; declines payments awaiting approval |
+| `GET` | `/api/v1/mandates/{id}/payments` | Everything the agent attempted, newest 100 |
+| `GET` | `/api/v1/agent-payments/awaiting-approval` | The caller's payments over a limit waiting for a decision |
+| `GET` | `/api/v1/agent-payments/{id}` | One agent payment. Owner only |
+| `POST` | `/api/v1/agent-payments/{id}/approve` | Pays the held money |
+| `POST` | `/api/v1/agent-payments/{id}/decline` | Releases the held money |
+| `GET` | `/api/v1/agent/mandate` | Agent key only: its limits and what is left today |
+| `POST` | `/api/v1/agent/payments` | Agent key only: `{ "toAccountNumber", "amount", "intent" }` plus `Idempotency-Key`; 201 with status `POSTED`, `PENDING_APPROVAL` or `REJECTED` |
+| `GET` | `/api/v1/agent/payments`, `/api/v1/agent/payments/{id}` | Agent key only: its own payments |
 | `POST` | `/api/v1/webhook-endpoints` | `{ "url", "eventTypes"? }`. Returns the signing secret once |
 | `GET` | `/api/v1/webhook-endpoints` | The caller's endpoints |
 | `DELETE` | `/api/v1/webhook-endpoints/{id}` | Deactivate |
@@ -284,7 +318,7 @@ Sending the same command again with the same `$KEY` returns the identical respon
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/ratelimit`: token-bucket limiter, limits, filter
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator, V14 balance checkpoints, V15 multi-currency and FX)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator, V14 balance checkpoints, V15 multi-currency and FX, V16 agent mandates)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
