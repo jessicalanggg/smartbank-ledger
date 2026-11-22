@@ -67,6 +67,14 @@ public class ApiExceptionHandler {
     public ProblemDetail holdNotFound(HoldNotFoundException ex) {
         return problem(HttpStatus.NOT_FOUND, "Hold not found", ex.getMessage());
     }
+    @ExceptionHandler(com.smartbank.agent.MandateNotFoundException.class)
+    public ProblemDetail mandateNotFound(com.smartbank.agent.MandateNotFoundException ex) {
+        return problem(HttpStatus.NOT_FOUND, "Mandate not found", ex.getMessage());
+    }
+    @ExceptionHandler(com.smartbank.agent.AgentPaymentNotFoundException.class)
+    public ProblemDetail agentPaymentNotFound(com.smartbank.agent.AgentPaymentNotFoundException ex) {
+        return problem(HttpStatus.NOT_FOUND, "Agent payment not found", ex.getMessage());
+    }
     @ExceptionHandler(BankingException.class)
     public ProblemDetail banking(BankingException ex) {
         return problem(HttpStatus.CONFLICT, "Banking operation rejected", ex.getMessage());

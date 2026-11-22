@@ -88,8 +88,16 @@ public class IdempotencyService {
      */
     public ResponseEntity<String> execute(String headerKey, String bodyKey, String fingerprint,
                                           HttpStatus successStatus, Function<String, Object> operation) {
+        return executeAs(access.currentUserId(), headerKey, bodyKey, fingerprint, successStatus, operation);
+    }
+
+    /**
+     * As {@link #execute}, with keys scoped to {@code user} instead of the signed-in
+     * user: for callers authenticated another way (an AI agent acts for its owner).
+     */
+    public ResponseEntity<String> executeAs(UUID user, String headerKey, String bodyKey, String fingerprint,
+                                            HttpStatus successStatus, Function<String, Object> operation) {
         String key = resolveKey(headerKey, bodyKey);
-        UUID user = access.currentUserId();
         Claim claim = claim(user, key, fingerprint);
         if (claim.completed())
             return respond(claim.responseStatus(), claim.responseBody(), true);

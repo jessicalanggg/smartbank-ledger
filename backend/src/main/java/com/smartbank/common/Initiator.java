@@ -10,6 +10,9 @@ public final class Initiator {
 
     public static UUID current() {
         var auth = SecurityContextHolder.getContext().getAuthentication();
+        // An AI agent acts for the customer who gave it its mandate.
+        if (auth instanceof com.smartbank.agent.AgentAuthentication agent)
+            return agent.getPrincipal().userId();
         if (auth instanceof JwtAuthenticationToken token) {
             try {
                 return UUID.fromString(token.getToken().getSubject());

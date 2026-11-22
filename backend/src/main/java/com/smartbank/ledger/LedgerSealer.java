@@ -161,7 +161,7 @@ public class LedgerSealer {
         jdbc.query("""
                 SELECT id, transaction_type, source_account_id, destination_account_id, amount, currency, request_key,
                        created_at, link_id, link_index, reverses_transaction_id, initiated_by,
-                       counter_amount, counter_currency, fx_rate, fx_quote_id
+                       counter_amount, counter_currency, fx_rate, fx_quote_id, agent_mandate_id
                 FROM banking_transactions WHERE id = ANY (?)""",
                 rs -> {
                     // FX fields are appended only when present, so transactions sealed before
@@ -169,6 +169,8 @@ public class LedgerSealer {
                     String fx = rs.getBigDecimal("counter_amount") == null ? "" : "|fx:" + String.join(",",
                             money(rs.getBigDecimal("counter_amount")), rs.getString("counter_currency"),
                             rs.getBigDecimal("fx_rate").toPlainString(), rs.getString("fx_quote_id"));
+                    // Likewise the agent mandate, for transfers an agent made.
+                    if (rs.getString("agent_mandate_id") != null) fx += "|agent:" + rs.getString("agent_mandate_id");
                     tx.put(rs.getObject("id", UUID.class), fx(String.join("|",
                             rs.getString("id"), rs.getString("transaction_type"), text(rs.getString("source_account_id")),
                             text(rs.getString("destination_account_id")), money(rs.getBigDecimal("amount")),

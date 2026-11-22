@@ -96,6 +96,17 @@ public class HoldService {
         }
     }
 
+    /**
+     * Places a hold inside the caller's transaction, for flows that decide in the same
+     * transaction whether to hold (an agent payment awaiting its owner's approval).
+     */
+    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.MANDATORY)
+    public HoldResponse createInCurrentTransaction(CreateHoldRequest request) {
+        if (request.fromAccountId().equals(request.toAccountId()))
+            throw new BankingException("Source and destination must differ");
+        return insertHold(request);
+    }
+
     private HoldResponse insertHold(CreateHoldRequest request) {
         UUID from = request.fromAccountId(), to = request.toAccountId();
         Map<UUID, Account> found = new HashMap<>();
@@ -124,6 +135,19 @@ public class HoldService {
     /** Posts the hold, in full when amount is null, releasing any remainder. */
     @Transactional(noRollbackFor = HoldExpiredException.class)
     public HoldResponse post(UUID holdId, BigDecimal requestedAmount) {
+        return post(holdId, requestedAmount, null);
+    }
+
+    /**
+     * Posts the hold in full for an agent payment its owner approved; the transfer
+     * records the mandate. Joins the caller's transaction.
+     */
+    @Transactional(noRollbackFor = HoldExpiredException.class)
+    public HoldResponse postForAgent(UUID holdId, UUID agentMandateId) {
+        return post(holdId, null, agentMandateId);
+    }
+
+    private HoldResponse post(UUID holdId, BigDecimal requestedAmount, UUID agentMandateId) {
         Hold hold = lockedHold(holdId);
         BigDecimal amount = requestedAmount == null ? hold.getAmount() : requestedAmount;
         switch (hold.getStatus()) {
@@ -147,7 +171,7 @@ public class HoldService {
             throw new HoldExpiredException();
         }
         TransactionResponse tx = banking.record(TransactionType.TRANSFER, hold.getSourceAccountId(),
-                hold.getDestinationAccountId(), amount, hold.getCurrency(), null);
+                hold.getDestinationAccountId(), amount, hold.getCurrency(), null, agentMandateId);
         hold.markPosted(amount, tx.id(), now);
         holds.flush();
         HoldResponse response = publish(EventTypes.HOLD_POSTED, hold);

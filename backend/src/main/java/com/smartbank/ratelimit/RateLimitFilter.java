@@ -56,6 +56,13 @@ public class RateLimitFilter extends OncePerRequestFilter {
             decision = limiter.tryAcquire("user:" + user, limits.apiPerUser());
             if (decision.allowed() && WRITES.contains(request.getMethod()))
                 decision = limiter.tryAcquire("user-writes:" + user, limits.writesPerUser());
+        } else if (SecurityContextHolder.getContext().getAuthentication()
+                instanceof com.smartbank.agent.AgentAuthentication agent) {
+            // Each agent key has its own limits, as a user does.
+            String mandate = agent.getPrincipal().mandateId().toString();
+            decision = limiter.tryAcquire("agent:" + mandate, limits.apiPerUser());
+            if (decision.allowed() && WRITES.contains(request.getMethod()))
+                decision = limiter.tryAcquire("agent-writes:" + mandate, limits.writesPerUser());
         } else {
             decision = limiter.tryAcquire("anonymous-ip:" + ip, limits.anonymousPerIp());
         }

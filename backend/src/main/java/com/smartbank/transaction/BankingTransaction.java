@@ -30,6 +30,8 @@ public class BankingTransaction {
     @Column(name = "counter_currency", length = 3, updatable = false) private String counterCurrency;
     @Column(name = "fx_rate", precision = 20, scale = 10, updatable = false) private BigDecimal fxRate;
     @Column(name = "fx_quote_id", updatable = false) private UUID fxQuoteId;
+    /** Set when an AI agent caused this transfer: the mandate it paid under. */
+    @Column(name = "agent_mandate_id", updatable = false) private UUID agentMandateId;
 
     protected BankingTransaction() { }
     public BankingTransaction(TransactionType type, UUID source, UUID destination,
@@ -93,6 +95,12 @@ public class BankingTransaction {
         this.initiatedBy = user;
         return this;
     }
+    /** Records the agent mandate this transfer was paid under; set before it is written. */
+    BankingTransaction byAgent(UUID mandateId) {
+        this.agentMandateId = mandateId;
+        return this;
+    }
+    public UUID getAgentMandateId() { return agentMandateId; }
     public UUID getLinkId() { return linkId; }
     public Integer getLinkIndex() { return linkIndex == null ? null : linkIndex.intValue(); }
 }
