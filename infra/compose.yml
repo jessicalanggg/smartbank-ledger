@@ -18,8 +18,10 @@ services:
     build: ../backend
     environment:
       DB_URL: jdbc:postgresql://db:5432/smartbank
+      # Migrations run as the owner; the app connects as smartbank_app (see V17).
       DB_USER: smartbank
       DB_PASSWORD: ${DB_PASSWORD:-local_dev_only}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:-local_dev_app_only}
       JWT_SECRET: ${JWT_SECRET:-local_only_jwt_signing_key_change_before_any_deployment_2026}
       WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY:-local_only_webhook_encryption_key_change_before_deploying_2026}
       # Local development only: lets webhooks reach a receiver on your machine.

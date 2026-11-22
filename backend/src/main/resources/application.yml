@@ -3,8 +3,9 @@ spring:
     name: smartbank
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/smartbank}
-    username: ${DB_USER:smartbank}
-    password: ${DB_PASSWORD:local_dev_only}
+    # The app runs as smartbank_app, which can add to the ledger but not rewrite it (V17).
+    username: ${DB_APP_USER:smartbank_app}
+    password: ${DB_APP_PASSWORD:local_dev_app_only}
     hikari:
       # No database transaction may stay open longer than this. Balance checkpoints rely on
       # it: once a moment is further back than the checkpoint horizon, nothing can still
@@ -22,6 +23,9 @@ spring:
       hibernate.order_inserts: true
   flyway:
     enabled: true
+    # Migrations run as the schema owner.
+    user: ${DB_USER:smartbank}
+    password: ${DB_PASSWORD:local_dev_only}
 management:
   endpoints:
     web:
@@ -31,6 +35,9 @@ server:
   port: 8080
 
 smartbank:
+  db:
+    # Set on the smartbank_app role after each migration; leave empty if an administrator manages the role.
+    app-password: ${DB_APP_PASSWORD:local_dev_app_only}
   jwt-secret: ${JWT_SECRET}
   demo-password: ${DEMO_PASSWORD:}
   rate-limits:
