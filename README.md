@@ -14,6 +14,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Reversals.** Mistakes are corrected with a new `REVERSAL` posting that points at the original and moves money back along the same path, never by editing history. Partial reversals are allowed but never exceed the original in total, enforced by a database trigger that locks the original at commit. A payee can refund a transfer; only an administrator can reverse deposits and withdrawals.
 - **Tamper-evident history and an audit trail.** Every transaction records who started it. A background job seals committed transactions into a SHA-256 hash chain (each seal covers its transactions, their entries and the previous seal), so any change to sealed history, even with the database's append-only triggers switched off, is detected. Reconciliation verifies the chain on every run.
 - **Balance checkpoints and statements.** Each account's running debit and credit totals are checkpointed per day, so a balance at any moment is the latest checkpoint plus the few entries since. Customers get statements with an opening balance, every posting with a running balance, and a closing balance; the administrator trial balance reads through the same checkpoints. Reconciliation re-checks every checkpoint against the entries.
+- **Multi-currency with FX.** Accounts in CAD, USD, EUR, GBP or JPY, with amounts limited to each currency's decimals (no ¥10.5). Converting is quote-then-execute: a quote locks the rate and both amounts for 60 seconds and can be used once. An FX transfer is one transaction whose entries balance within each currency through per-currency FX position accounts, and the database rejects any transaction that does not.
 - **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
 - **Idempotency keys, scoped per user.** Every deposit, withdrawal, transfer and hold takes an `Idempotency-Key` header (or the `requestKey` body field). The first response, success or business error, is stored and replayed byte-for-byte for retries, marked `Idempotent-Replayed: true`, even when many retries arrive at once. Reusing a key for a different request returns 422. Keys are scoped to the calling user and expire after 24 hours. Posting stays exactly-once even if the server stops between posting and storing the response.
 - **Short, deadlock-free locking.** A transfer writes its transaction and ledger entries first, then updates both balances last with atomic statements in UUID order (the debit only succeeds if available funds cover it). Account locks are held only for those final statements and the commit, and opposing transfers (A→B and B→A) cannot deadlock.
@@ -46,6 +47,7 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | Webhook hardening tests | 33 SSRF URL cases; internal URLs refused at registration; a host that now resolves internally gets no request; secrets stored only encrypted and bound to their endpoint; old plain-text secrets migrated; rotation signs with both secrets during the overlap; dead-lettered deliveries resent |
 | Webhook tests (real HTTP receiver) | Events only for committed changes; routing to payer and payee only; signatures verify and reject tampering; retries on schedule; dead-lettering; timeouts; expired leases; 6 concurrent workers deliver 120 events exactly once |
 | Hold API tests (real JWT security) | Only the payer can place a hold, only the payee can post or void it, only the two parties can see it |
+| FX tests | A quote locks its rate even if the rate changes; execution posts four entries that balance within each currency, with balanced trial balances in both; rounding down to each currency's decimals (including JPY); quotes are single-use, expire and are private; paying another user's account; a failed execution leaves the quote usable; same-currency, missing-rate and plain cross-currency transfers rejected; JPY decimals rejected; rates are admin-only; 20 racing executions of one quote post once; the database rejects an FX transaction that does not balance per currency; FX details are covered by the hash chain |
 | Checkpoint tests | Balances at many moments, through checkpoints, equal a full scan of the entries; the trial balance through checkpoints matches the entries; the job checkpoints each boundary once and only past the horizon; an entry committed after its checkpoint is reported; an altered checkpoint is reported; statements show opening, lines with running balance and closing, and are owner-only; database transactions are time-limited |
 | Hash-chain tests | Every committed transaction sealed once into one chain; a balanced change invisible to reconciliation (transaction, entries and balances all altered consistently) caught by the chain; changed details and deleted transactions caught; re-sealing a tampered seal breaks the next link, and a full rewrite is caught against an externally recorded head; concurrent sealers never fork the chain; initiators recorded and visible to administrators |
 | Chart of accounts tests | Every customer account gets its own liability account; each posting type produces the right debits and credits; the trial balance balances and satisfies the accounting equation, now and as of an earlier moment; fees need funds and are idempotent; the ledger API is admin-only; the database rejects an account whose normal side contradicts its type; reconciliation notices an entry with no chart account |
@@ -71,6 +73,7 @@ Every transaction posts journal lines whose debits equal its credits. Lines post
 | 1000 | Cash and settlement | Asset | Debit |
 | 2000 | Customer deposits (control account) | Liability | Credit |
 | 2000-*number* | One per customer account, under 2000 | Liability | Credit |
+| 3500 | FX position | Equity | Credit |
 | 3900 | Opening balance equity | Equity | Credit |
 | 4000 | Fee revenue | Revenue | Credit |
 
@@ -86,12 +89,27 @@ A customer's money is a liability of the bank (the bank owes it to them), so a c
 | Reversal of 30 of a transfer A→B | DR B 30 · CR A 30 |
 | Reversal of a deposit of 100 | DR customer 100 · CR 1000 Cash 100 |
 | Opening balance 100 | DR 3900 Opening balance equity 100 · CR customer 100 |
+| FX transfer: 100 CAD buys 73.33 USD | CAD: DR payer 100 · CR 3500 FX position 100 — USD: DR 3500 FX position 73.33 · CR payee 73.33 |
 
 Entries are stored with signed amounts (positive = credit, negative = debit); the `journal_lines` view shows each entry as a debit or credit line on its chart account. Administrators get a **trial balance** per currency, optionally as of any past moment, which checks that total debits equal total credits and that **Assets = Liabilities + Equity + Revenue − Expenses**, with the customer control account rolling up every customer's balance.
 
 `accounts.balance` is kept as a cached balance, because transfers lock the account row and check funds against it. The ledger is the record it must agree with, which [`LedgerReconciliation`](backend/src/main/java/com/smartbank/ledger/LedgerReconciliation.java) verifies. Balances that existed before the ledger (migration `V4`) were posted as opening balances dated before each account's first transaction.
 
 The external and equity sides are ledger accounts without a row in `accounts`, so deposits and withdrawals never lock a shared row and do not serialize on it.
+
+## How FX works
+
+```
+POST /fx/quotes    { fromAccountId: <CAD account>, toAccountId: <USD account>, amount: "100.00" }
+  → { id, sellAmount: 100.00 CAD, buyAmount: 73.33 USD, rate: 0.7333, expiresAt: +60 s }
+POST /fx/transfers { quoteId }   (with an Idempotency-Key)
+  → FX_TRANSFER: amount 100.00 CAD, counterAmount 73.33 USD, fxRate 0.7333
+```
+
+- **Rates** are set per direction by administrators (1 base buys `rate` quote), because a bank's buy and sell rates differ; rates are append-only and the latest is current.
+- **Quotes** lock the rate and both amounts. The received amount is rounded down to the target currency's minor unit (JPY has none), and a quote can be executed once, by the user who got it, before it expires; the quote row is locked while it is used, so racing executions post once. A failed execution (for example insufficient funds) rolls back and leaves the quote usable.
+- **Ledger:** one transaction with four entries, balancing within each currency through that currency's **3500 FX position** account. The database's balance check now works per currency and allows two currencies only for FX transfers. The FX positions hold the bank's net position per currency; valuing them in one reporting currency (FX gain or loss) is not implemented.
+- FX transfers are not batched and cannot be reversed yet.
 
 ## How tamper evidence works
 
@@ -176,7 +194,7 @@ Start the frontend (`http://localhost:5173`, proxies `/api` to the backend):
 cd frontend && npm install && npm run dev
 ```
 
-Log in as `demo.a@smartbank.local` or `demo.b@smartbank.local` with the local demo password set in `infra/compose.yml`. Demo user A owns `DEMO-10001`; demo user B owns `DEMO-10002`.
+Log in as `demo.a@smartbank.local` or `demo.b@smartbank.local` with the local demo password set in `infra/compose.yml`. Demo user A owns `DEMO-10001` (CAD) and `DEMO-10003` (USD, for trying FX); demo user B owns `DEMO-10002` (CAD). Demonstration CAD/USD rates are seeded.
 
 Stop without deleting data with `docker compose -f infra/compose.yml down`. Adding `-v` deletes the database volume.
 
@@ -211,6 +229,10 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `POST` | `/api/v1/accounts/{id}/withdrawals` | `{ "amount": "25.00" }` |
 | `POST` | `/api/v1/transfers` | `{ "fromAccountId", "toAccountId", "amount" }`. Caller must own the source |
 | `POST` | `/api/v1/transfers/by-account-number` | `{ "fromAccountId", "toAccountNumber", "amount" }` |
+| `GET` | `/api/v1/fx/rates` | Current rate for each currency pair |
+| `POST` | `/api/v1/fx/rates` | `{ "baseCurrency", "quoteCurrency", "rate" }`: 1 base buys `rate` quote. Admin only |
+| `POST` | `/api/v1/fx/quotes` | `{ "fromAccountId", "toAccountId", "amount" }`: locks the rate and both amounts for 60 s. Caller must own the source |
+| `POST` | `/api/v1/fx/transfers` | `{ "quoteId" }` plus `Idempotency-Key`: executes the quote, once |
 | `POST` | `/api/v1/accounts/{id}/fees` | `{ "amount" }`. Charges a fee, credited to fee revenue. Admin only |
 | `GET` | `/api/v1/ledger/accounts` | Chart of accounts with balances; `?currency=`, `?asOf=`. Admin only |
 | `GET` | `/api/v1/ledger/trial-balance` | Debits, credits, balances by type, and the accounting-equation check; `?currency=`, `?asOf=`. Admin only |
@@ -262,14 +284,14 @@ Sending the same command again with the same `$KEY` returns the identical respon
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/ratelimit`: token-bucket limiter, limits, filter
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator, V14 balance checkpoints)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator, V14 balance checkpoints, V15 multi-currency and FX)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
 
 ## Limitations and roadmap
 
-Not implemented: refresh tokens or token revocation, MFA, account opening, audit logging, pagination beyond the newest 100 transactions, and cross-currency transfers. The demo password, JWT secret and webhook encryption key in `infra/compose.yml` are for local use only, and Compose allows http and private webhook targets so a receiver on your machine works; production must set `WEBHOOK_ENCRYPTION_KEY` and leave `WEBHOOK_ALLOW_HTTP` and `WEBHOOK_ALLOW_PRIVATE_TARGETS` off.
+Not implemented: refresh tokens or token revocation, MFA, account opening, pagination beyond the newest 100 transactions, FX revaluation and FX reversals. The demo password, JWT secret and webhook encryption key in `infra/compose.yml` are for local use only, and Compose allows http and private webhook targets so a receiver on your machine works; production must set `WEBHOOK_ENCRYPTION_KEY` and leave `WEBHOOK_ALLOW_HTTP` and `WEBHOOK_ALLOW_PRIVATE_TARGETS` off.
 
 Next steps:
 - Re-run the throughput benchmarks on a quiet machine.
