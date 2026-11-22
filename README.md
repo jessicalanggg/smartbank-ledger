@@ -1,7 +1,5 @@
 # SmartBank
 
-[![CI](https://github.com/jessicalanggg/smartbank/actions/workflows/ci.yml/badge.svg)](https://github.com/jessicalanggg/smartbank/actions/workflows/ci.yml)
-
 **A double-entry banking ledger that lets AI agents spend money within limits the database enforces.** Java 21, Spring Boot and PostgreSQL, with a React frontend and an MCP server for agents.
 
 **Educational simulation only.** All data is synthetic. Do not expose it to the internet or use real personal or financial data.
