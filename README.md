@@ -12,6 +12,7 @@ A banking transfer API built with Java 21, Spring Boot and PostgreSQL. It focuse
 - **Transactional outbox and signed webhooks.** Every posting and hold change writes an event in the same database transaction, so an event exists if and only if its change committed. A worker delivers events to subscribed endpoints with HMAC-SHA256 signatures, at least once, with exponential backoff, a dead-letter state, and `SKIP LOCKED` leases so several instances can deliver safely. Webhook URLs are checked against SSRF (no internal or private addresses) at registration and before every delivery; signing secrets are encrypted at rest and can be rotated with an overlap; dead-lettered deliveries can be resent. See [docs/webhooks.md](docs/webhooks.md).
 - **Linked transfers.** Up to 20 transfers that post together or not at all, such as "charge the customer, pay the merchant, take a fee". Funds are checked on each account's net change across the group, every leg gets its own ledger entries and event tagged with the group's `linkId`, and the whole group is written in one SQL statement.
 - **Reversals.** Mistakes are corrected with a new `REVERSAL` posting that points at the original and moves money back along the same path, never by editing history. Partial reversals are allowed but never exceed the original in total, enforced by a database trigger that locks the original at commit. A payee can refund a transfer; only an administrator can reverse deposits and withdrawals.
+- **Tamper-evident history and an audit trail.** Every transaction records who started it. A background job seals committed transactions into a SHA-256 hash chain (each seal covers its transactions, their entries and the previous seal), so any change to sealed history, even with the database's append-only triggers switched off, is detected. Reconciliation verifies the chain on every run.
 - **Atomic money movement.** Each operation runs in one `@Transactional` unit: balance updates, the transaction record and its ledger entries commit together or roll back together.
 - **Idempotency keys, scoped per user.** Every deposit, withdrawal, transfer and hold takes an `Idempotency-Key` header (or the `requestKey` body field). The first response, success or business error, is stored and replayed byte-for-byte for retries, marked `Idempotent-Replayed: true`, even when many retries arrive at once. Reusing a key for a different request returns 422. Keys are scoped to the calling user and expire after 24 hours. Posting stays exactly-once even if the server stops between posting and storing the response.
 - **Short, deadlock-free locking.** A transfer writes its transaction and ledger entries first, then updates both balances last with atomic statements in UUID order (the debit only succeeds if available funds cover it). Account locks are held only for those final statements and the commit, and opposing transfers (A→B and B→A) cannot deadlock.
@@ -44,6 +45,7 @@ All tests run against real PostgreSQL in Testcontainers, apart from the unit tes
 | Webhook hardening tests | 33 SSRF URL cases; internal URLs refused at registration; a host that now resolves internally gets no request; secrets stored only encrypted and bound to their endpoint; old plain-text secrets migrated; rotation signs with both secrets during the overlap; dead-lettered deliveries resent |
 | Webhook tests (real HTTP receiver) | Events only for committed changes; routing to payer and payee only; signatures verify and reject tampering; retries on schedule; dead-lettering; timeouts; expired leases; 6 concurrent workers deliver 120 events exactly once |
 | Hold API tests (real JWT security) | Only the payer can place a hold, only the payee can post or void it, only the two parties can see it |
+| Hash-chain tests | Every committed transaction sealed once into one chain; a balanced change invisible to reconciliation (transaction, entries and balances all altered consistently) caught by the chain; changed details and deleted transactions caught; re-sealing a tampered seal breaks the next link, and a full rewrite is caught against an externally recorded head; concurrent sealers never fork the chain; initiators recorded and visible to administrators |
 | Chart of accounts tests | Every customer account gets its own liability account; each posting type produces the right debits and credits; the trial balance balances and satisfies the accounting equation, now and as of an earlier moment; fees need funds and are idempotent; the ledger API is admin-only; the database rejects an account whose normal side contradicts its type; reconciliation notices an entry with no chart account |
 | Ledger tests | Each operation posts the right balanced entries; unbalanced postings, transactions without entries, and edits or deletes of history are rejected by PostgreSQL; reconciliation detects a balance changed outside the ledger |
 | Model-based randomized test | 4,800 random operations per run (transfers, linked transfers, fees, reversals, retries, key conflicts, holds, posts, voids, expiry) match an independent model after every step; failures shrink to a minimal reproduction with a seed |
@@ -88,6 +90,20 @@ Entries are stored with signed amounts (positive = credit, negative = debit); th
 `accounts.balance` is kept as a cached balance, because transfers lock the account row and check funds against it. The ledger is the record it must agree with, which [`LedgerReconciliation`](backend/src/main/java/com/smartbank/ledger/LedgerReconciliation.java) verifies. Balances that existed before the ledger (migration `V4`) were posted as opening balances dated before each account's first transaction.
 
 The external and equity sides are ledger accounts without a row in `accounts`, so deposits and withdrawals never lock a shared row and do not serialize on it.
+
+## How tamper evidence works
+
+```
+seal 1: SHA-256(genesis, 1, transactions sealed in 1)        ─┐
+seal 2: SHA-256(hash of seal 1, 2, transactions sealed in 2)  ├─ each seal covers its transactions, their
+seal 3: SHA-256(hash of seal 2, 3, transactions sealed in 3) ─┘  ledger entries, and the previous seal
+```
+
+- Every few seconds the sealer ([`LedgerSealer`](backend/src/main/java/com/smartbank/ledger/LedgerSealer.java)) takes the committed transactions not yet sealed and appends one seal over them. Each transaction is hashed with all its fields (type, accounts, amount, request key, time, initiator, links) and all its ledger entries, in a fixed text form.
+- Change, add or remove anything already sealed and the recomputed hash of that seal no longer matches; recompute that seal too and the next seal's link breaks. Rewriting every later seal is caught by comparing the head with a copy kept outside the database: the sealer logs every new head, and `GET /ledger/seals/head` returns it.
+- The tests show the point: a 30.00 transfer quietly turned into 40.00, with its entries and both balances adjusted to match, passes every other reconciliation check, and only the chain catches it.
+- Sealing runs after commit and in the background, so posting never waits on a single chain head; a PostgreSQL advisory lock keeps concurrent sealers from forking the chain. Transactions committed since the last seal (a few seconds' worth) are not yet covered.
+- Every transaction records `initiated_by`, the user whose request created it (null for the system, such as the hold expiry job). Batched postings capture it on the request's thread, since batch workers have no login of their own.
 
 ## How holds work
 
@@ -190,6 +206,9 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `GET` | `/api/v1/ledger/accounts` | Chart of accounts with balances; `?currency=`, `?asOf=`. Admin only |
 | `GET` | `/api/v1/ledger/trial-balance` | Debits, credits, balances by type, and the accounting-equation check; `?currency=`, `?asOf=`. Admin only |
 | `GET` | `/api/v1/ledger/transactions/{id}/journal` | A transaction's debit and credit lines. Admin only |
+| `GET` | `/api/v1/ledger/transactions/{id}` | Who started the transaction and which seal covers it. Admin only |
+| `GET` | `/api/v1/ledger/seals/head` | The latest seal; record its hash outside the database. Admin only |
+| `GET` | `/api/v1/ledger/seals/verify` | Recomputes the hash chain and reports the first broken seal. Admin only |
 | `POST` | `/api/v1/transactions/{id}/reversals` | Optional `{ "amount" }`; without it, whatever is not yet reversed. Transfers: payee or admin. Deposits and withdrawals: admin |
 | `POST` | `/api/v1/transfers/linked` | `{ "transfers": [ { "fromAccountId", "toAccountId", "amount" }, … ] }`, 1–20 legs, all or nothing. Caller must own every source |
 | `GET` | `/api/v1/accounts/{id}/transactions` | Newest 100, owner only |
@@ -233,7 +252,7 @@ Sending the same command again with the same `$KEY` returns the identical respon
 - `backend/src/main/java/com/smartbank/idempotency`: per-user idempotency keys, stored responses, pruning
 - `backend/src/main/java/com/smartbank/ratelimit`: token-bucket limiter, limits, filter
 - `backend/src/main/java/com/smartbank/auth`: JWT login, registration, ownership checks
-- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts)
+- `backend/src/main/resources/db/migration`: Flyway schema (V1 accounts, V2 transactions, V3 users and ownership, V4 ledger, V5 holds, V6 idempotency keys, V7 outbox and webhooks, V8 linked transfers, V9 reversals, V10 rate limits, V11 webhook hardening, V12 chart of accounts, V13 seals and initiator)
 - `backend/src/test`: unit, integration, concurrency, model-based and fault-injection tests, and the hot-account benchmark
 - `frontend`: React + TypeScript UI
 - `infra/compose.yml`: local PostgreSQL and backend
