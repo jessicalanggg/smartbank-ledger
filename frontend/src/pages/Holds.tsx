@@ -7,7 +7,7 @@ import {
     voidHold,
     type Account,
     type Hold,
-} from "./api";
+} from "../api";
 
 const money = (amount: number, currency: string) =>
     new Intl.NumberFormat("en-CA", { style: "currency", currency }).format(amount);

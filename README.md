@@ -52,7 +52,7 @@ Same request, same key      → 201, byte-identical body, Idempotent-Replayed: t
 Same key, different request → 422
 ```
 
-The frontend covers accounts (with a total per currency), history, deposits, withdrawals, transfers by account number, and holds (place, capture in full or in part, release). Selecting a transaction shows the debit and credit lines it posted and the signed seal that covers it. Administrators get a **Ledger** page: the trial balance for each currency with its debits = credits and accounting-equation checks, and a **Verify history** button that rechecks the whole signed hash chain. It works on phones too, with a bottom tab bar.
+The frontend covers accounts (with a total per currency), history, deposits, withdrawals, transfers by account number, holds (place, capture in full or in part, release), **statements** with a running balance, **currency exchange** at a quoted rate held for 60 seconds, and **refunds** of received transfers. Selecting a transaction shows the debit and credit lines it posted and the signed seal that covers it. Administrators get a **Ledger** page: the trial balance for each currency with its debits = credits and accounting-equation checks, and a **Verify history** button that rechecks the whole signed hash chain. Every page has its own URL, and it works on phones with a bottom tab bar. Vitest and React Testing Library tests cover the money formatting, the sign-in and routing, the transfer retry (same idempotency key), quote expiry and refunds.
 
 ## Features
 
@@ -70,7 +70,7 @@ The frontend covers accounts (with a total per currency), history, deposits, wit
 
 ## Tech stack
 
-Java 21, Spring Boot 3.5, Spring Data JPA, Spring Security (OAuth2 resource server, JWT), PostgreSQL 17, Flyway, Testcontainers, Toxiproxy, JUnit 5, Mockito, React 19, TypeScript, Vite, Docker Compose, GitHub Actions.
+Java 21, Spring Boot 3.5, Spring Data JPA, Spring Security (OAuth2 resource server, JWT), PostgreSQL 17, Flyway, Testcontainers, Toxiproxy, JUnit 5, Mockito, React 19, TypeScript, Vite, Vitest, React Testing Library, Docker Compose, GitHub Actions.
 
 ## Run it locally
 
@@ -114,8 +114,6 @@ Run the tests with `cd backend && mvn test` (JDK 21), or entirely in Docker as d
 Not implemented: refresh tokens or token revocation, MFA, account opening, pagination beyond the newest 100 transactions, FX revaluation and FX reversals. The demo password, JWT secret and webhook encryption key in `infra/compose.yml` are for local use only, and Compose allows http and private webhook targets so a receiver on your machine works; production must set `WEBHOOK_ENCRYPTION_KEY` and leave `WEBHOOK_ALLOW_HTTP` and `WEBHOOK_ALLOW_PRIVATE_TARGETS` off.
 
 Next steps:
-- Re-run the throughput benchmarks on a quiet machine.
 - Close the remaining DNS-rebinding window for webhooks with an egress proxy, and allow rotating the secret-encryption key.
-- Frontend navigation on phones (the sidebar is hidden below 520 px, leaving only the Overview page).
 
 Development history by sprint: [Sprint 2](SPRINT2_README.md) (transactions), [Sprint 3](SPRINT3_README.md) (authentication), [frontend](frontend/README.md).

@@ -56,3 +56,26 @@ export function describe(t: Transaction, accountId: string, accounts: Account[])
     else if (other) detail = `${incoming ? "From" : "To"} ${other}`;
     return { label: typeLabel(t.type), detail, amount: incoming ? amount : -amount, currency };
 }
+
+/** A date and time in Toronto, the bank's home time zone: "Nov 22, 2026, 3:04 p.m.". */
+export function formatDate(value: unknown): string {
+    if (value === null || value === undefined || value === "") return "—";
+    const date = new Date(String(value));
+    if (Number.isNaN(date.getTime())) return String(value);
+    return new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/Toronto",
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+    }).format(date);
+}
+
+/** Money typed by a person: positive, at most two decimal places. Null when it is not. */
+export function parseAmount(text: string): number | null {
+    if (!/^\d+(\.\d{1,2})?$/.test(text.trim())) return null;
+    const value = Number(text);
+    return Number.isFinite(value) && value > 0 ? value : null;
+}

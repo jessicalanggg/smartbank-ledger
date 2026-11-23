@@ -60,8 +60,8 @@ aside .side-bottom{margin-top:auto}
 .tabbar{display:none}
 @media(max-width:520px){
   .tabbar{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;position:fixed;left:0;right:0;bottom:0;z-index:20;background:#fff;border-top:1px solid #e6ebf2;padding:6px 4px calc(6px + env(safe-area-inset-bottom));box-shadow:0 -6px 18px #1c3e7d12}
-  .tabbar button{display:flex;flex-direction:column;align-items:center;gap:3px;border:0;background:transparent;color:#7c89a4;font-size:11px;font-weight:600;padding:6px 2px;border-radius:9px}
-  .tabbar button.active{color:#225ac8;background:#eaf1ff}
+  .tabbar a{display:flex;flex-direction:column;align-items:center;gap:3px;border:0;background:transparent;color:#7c89a4;font-size:11px;font-weight:600;padding:6px 2px;border-radius:9px}
+  .tabbar a.active{color:#225ac8;background:#eaf1ff}
   .content{padding-bottom:96px}
   /* The transaction table becomes a stacked list */
   .history-scroll{overflow-x:visible}
@@ -132,3 +132,86 @@ aside .side-bottom{margin-top:auto}
   .ledger-table th:nth-child(n+2):nth-child(-n+4),.ledger-table td:nth-child(n+2):nth-child(-n+4),.ledger-table tfoot{display:none}
   .ledger-table tr.child td:first-child{padding-left:18px}
 }
+
+/* Navigation links (real URLs) */
+a.nav,.tabbar a{text-decoration:none}
+aside nav{display:flex;flex-direction:column;gap:4px}
+aside .nav{padding:11px 13px}
+aside .nav:focus-visible,.tabbar a:focus-visible{outline:2px solid #2d66d3;outline-offset:2px}
+
+/* Header actions */
+.header-actions{display:flex;gap:8px}
+.phone-only{display:none}
+@media(max-width:520px){.phone-only{display:flex}}
+.spin{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Buttons used outside full-width forms */
+.primary{display:flex;align-items:center;justify-content:center;gap:8px;background:#225ac8;color:#fff;border:0;border-radius:8px;padding:10px 16px;font-weight:700}
+.transfer-details{display:grid;grid-template-columns:120px minmax(0,1fr);gap:12px;margin:20px 0}
+.transfer-details dt{color:#64748b}
+.transfer-details dd{margin:0;overflow-wrap:anywhere}
+.transfer-actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}
+.toolbar-button{align-self:end;height:46px}
+
+/* Toasts */
+.toasts{position:fixed;right:20px;bottom:20px;z-index:80;display:flex;flex-direction:column;gap:10px;width:min(380px,calc(100vw - 32px))}
+.toast{display:flex;align-items:flex-start;gap:10px;background:#fff;border-radius:11px;padding:13px 14px;font-size:14px;box-shadow:0 12px 32px #0f1b3329;border-left:4px solid;animation:toast-in .18s ease-out}
+.toast span{flex:1;line-height:1.4;color:#1d2939}
+.toast button{border:0;background:transparent;color:#8791a3;padding:2px;display:flex}
+.toast.success{border-color:#12b76a;color:#067647}
+.toast.error{border-color:#f04438;color:#a61b29}
+@keyframes toast-in{from{transform:translateY(8px);opacity:0}}
+@media(max-width:520px){.toasts{left:16px;right:16px;bottom:84px;width:auto}}
+
+/* Loading placeholders and empty states */
+.skeleton{display:flex;flex-direction:column;gap:12px;padding:8px 0}
+.skeleton span{display:block;border-radius:6px;background:linear-gradient(90deg,#eef2f7 25%,#e2e8f0 50%,#eef2f7 75%);background-size:200% 100%;animation:shimmer 1.2s infinite}
+.skeleton-card{min-height:150px;cursor:default}
+.skeleton-light{width:220px;border-radius:8px;background:#ffffff26;animation:pulse 1.2s infinite}
+@keyframes shimmer{to{background-position:-200% 0}}
+@keyframes pulse{50%{opacity:.5}}
+.empty-state{display:flex;flex-direction:column;align-items:center;text-align:center;gap:6px;padding:34px 16px;color:#8791a3;font-size:13px}
+.empty-state svg{color:#a9b4c7;margin-bottom:4px}
+.empty-state strong{color:#3b4a63;font-size:15px}
+
+/* Statements */
+.statement-head{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;margin-top:26px}
+.statement-head span{color:#77849a;font-size:13px}
+.statement-table .balance-cell{color:#5d6b82;font-weight:600}
+.statement-table .type-cell small{color:#8791a3;font-weight:400}
+.statement-table tr.statement-edge td{background:#f6f8fc;font-weight:700}
+.balance-strip dd.amount-in{color:#067647}
+@media(max-width:520px){
+  .statement-table tr{grid-template-areas:"type amount" "date balance"}
+  .statement-table .balance-cell{grid-area:balance;font-size:12px}
+  .statement-table .amount-cell:empty{display:none}
+}
+@media print{
+  aside,.tabbar,header,footer,.no-print,.toasts{display:none !important}
+  .content{padding:0}
+  .panel{border:0}
+  .transfer-receipt button{display:none !important}
+}
+
+/* Exchange */
+.quote{margin-top:20px;border:1px solid #c7d7fe;background:#f5f8ff;border-radius:12px;padding:18px}
+.quote.expired{border-color:#fedf89;background:#fffaeb}
+.quote-amounts{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.quote-amounts div{display:flex;flex-direction:column;gap:3px}
+.quote-amounts small{color:#77849a;font-size:12px}
+.quote-amounts strong{font-size:22px}
+.quote-amounts svg{color:#7c89a4;flex-shrink:0}
+.quote-rate{margin-top:10px;font-size:13px;color:#5d6b82}
+.quote-timer{position:relative;display:flex;align-items:center;gap:6px;margin-top:12px;padding-bottom:8px;font-size:13px;font-weight:600;color:#225ac8}
+.quote.expired .quote-timer{color:#b54708}
+.timer-bar{position:absolute;left:0;bottom:0;height:3px;border-radius:2px;background:#225ac8;transition:width .25s linear}
+.rates{margin-top:12px}
+
+/* Refunds */
+.refund-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:10px 0 4px}
+.refund-row small{color:#77849a;font-size:12px}
+.refund-form{border:1px solid #e6ebf2;border-radius:10px;padding:4px 14px 14px;margin:10px 0}
+.refund-note{display:flex;align-items:center;gap:6px;color:#77849a;font-size:13px}
+.statement .balance-strip{grid-template-columns:repeat(auto-fit,minmax(135px,1fr))}
+@media(max-width:520px){.statement .balance-strip{grid-template-columns:1fr 1fr}.balance-strip dd{font-size:16px}}

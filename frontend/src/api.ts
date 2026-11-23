@@ -12,15 +12,34 @@ export type Hold = {
 export type Transaction = Record<string, unknown>;
 export type LoginResponse = { accessToken: string; tokenType: string; expiresIn: number };
 const base = '/api/v1';
+
+/** A failed API call. The message is the server's explanation when it sent one. */
+export class ApiError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/** The server answers errors with RFC 9457 problem details; show their detail, not the JSON. */
+async function problemText(response: Response): Promise<string> {
+  let text = '';
+  try { text = await response.text(); } catch { /* no body */ }
+  try {
+    const problem = JSON.parse(text) as { detail?: string; title?: string };
+    if (problem.detail || problem.title) return String(problem.detail ?? problem.title);
+  } catch { /* not JSON */ }
+  if (response.status === 401) return 'Your session has ended. Sign in again.';
+  if (response.status === 403) return 'You do not have access to that.';
+  if (response.status === 429) return 'Too many requests. Wait a moment and try again.';
+  return text ? text.slice(0, 200) : `Request failed (HTTP ${response.status})`;
+}
 export async function request<T>(path: string, token: string | null, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (token) headers.set('Authorization', `Bearer ${token}`);
   if (init.body) headers.set('Content-Type', 'application/json');
   const response = await fetch(base + path, { ...init, headers });
-  if (!response.ok) {
-    let detail = ''; try { detail = (await response.text()).slice(0, 200); } catch { /* ignore */ }
-    throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
-  }
+  if (!response.ok) throw new ApiError(response.status, await problemText(response));
   if (response.status === 204) return undefined as T;
   // An endpoint that returns nothing (null) sends an empty body.
   const text = await response.text();
@@ -31,28 +50,6 @@ export function accounts(token: string) { return request<Account[]>('/accounts',
 export function transactions(token: string, id: string) { return request<Transaction[]>(`/accounts/${encodeURIComponent(id)}/transactions`, token); }
 export function deposit(token: string, id: string, amount: number, description: string, requestKey: string) { return request<unknown>(`/accounts/${encodeURIComponent(id)}/deposits`, token, { method: 'POST', body: JSON.stringify({ amount, description, requestKey }) }); }
 export function withdraw(token: string, id: string, amount: number, description: string, requestKey: string) { return request<unknown>(`/accounts/${encodeURIComponent(id)}/withdrawals`, token, { method: 'POST', body: JSON.stringify({ amount, description, requestKey }) }); }
-// Transfer request field names must be verified against your Spring Boot TransferRequest DTO before enabling transfers.
-export function transfer(
-  token: string,
-  fromAccountId: string,
-  toAccountId: string,
-  amount: number,
-  requestKey: string
-) {
-  return request<unknown>(
-    '/transfers',
-    token,
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        fromAccountId,
-        toAccountId,
-        amount,
-        requestKey
-      })
-    }
-  );
-}
 export function transferByAccountNumber(
   token: string,
   fromAccountId: string,
@@ -112,7 +109,8 @@ export function voidHold(token: string, holdId: string) {
 // The ledger behind a transaction, and the bank's books (administrators).
 export type JournalLine = { code: string; name: string; type: string; debit: number; credit: number; currency: string };
 export type SealInfo = { seq: number; sealedAt: string; signed: boolean; keyId?: string };
-export type TransactionDetails = { transaction: Transaction; journal: JournalLine[]; seal: SealInfo | null };
+/** refundable: for a transfer, what its payee can still send back. */
+export type TransactionDetails = { transaction: Transaction; journal: JournalLine[]; seal: SealInfo | null; refundable?: number };
 export function transactionDetails(token: string, id: string) {
   return request<TransactionDetails>(`/transactions/${encodeURIComponent(id)}/details`, token);
 }
@@ -142,4 +140,40 @@ export function roleOf(token: string): string {
   } catch {
     return 'CUSTOMER';
   }
+}
+
+/** Sends all or part of a received transfer back to its payer. Reuse the key to retry safely. */
+export function refund(token: string, transactionId: string, amount: number | undefined, requestKey: string) {
+  return request<Transaction>(`/transactions/${encodeURIComponent(transactionId)}/reversals`, token, {
+    method: 'POST',
+    body: JSON.stringify(amount === undefined ? { requestKey } : { amount, requestKey }),
+  });
+}
+
+// Statements
+export type StatementLine = {
+  postedAt: string; transactionId: string; type: string; counterparty: string | null; amount: number; balance: number;
+};
+export type Statement = {
+  accountId: string; accountNumber: string; currency: string; from: string; to: string;
+  openingBalance: number; moneyIn: number; moneyOut: number; closingBalance: number;
+  lines: StatementLine[]; truncated: boolean;
+};
+export function statement(token: string, accountId: string, from: Date, to: Date) {
+  const range = `from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(to.toISOString())}`;
+  return request<Statement>(`/accounts/${encodeURIComponent(accountId)}/statement?${range}`, token);
+}
+
+// Foreign exchange: a quote locks the rate briefly; executing it moves the money.
+export type FxRate = { id: string; baseCurrency: string; quoteCurrency: string; rate: number; setAt: string };
+export type FxQuote = {
+  id: string; fromAccountId: string; toAccountId: string; sellAmount: number; sellCurrency: string;
+  buyAmount: number; buyCurrency: string; rate: number; expiresAt: string;
+};
+export function fxRates(token: string) { return request<FxRate[]>('/fx/rates', token); }
+export function fxQuote(token: string, fromAccountId: string, toAccountId: string, amount: number) {
+  return request<FxQuote>('/fx/quotes', token, { method: 'POST', body: JSON.stringify({ fromAccountId, toAccountId, amount }) });
+}
+export function fxExecute(token: string, quoteId: string, requestKey: string) {
+  return request<Transaction>('/fx/transfers', token, { method: 'POST', body: JSON.stringify({ quoteId, requestKey }) });
 }

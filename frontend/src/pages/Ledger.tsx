@@ -9,8 +9,8 @@ import {
     type Seal,
     type SealVerification,
     type TrialBalance,
-} from "./api";
-import { money } from "./format";
+} from "../api";
+import { money } from "../format";
 
 const CURRENCIES = ["CAD", "USD", "EUR", "GBP", "JPY"];
 

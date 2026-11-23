@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
-import { BookOpen, Lock, ShieldCheck, X } from "lucide-react";
-import { transactionDetails, type Account, type TransactionDetails } from "./api";
-import { describe, money, signedMoney } from "./format";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { BookOpen, Lock, RotateCcw, ShieldCheck, X } from "lucide-react";
+import { refund, transactionDetails, type Account, type TransactionDetails } from "../api";
+import { describe, money, parseAmount, signedMoney } from "../format";
+import { Skeleton } from "./Skeleton";
+import { useToast } from "./Toasts";
 
 const when = (value?: string) =>
     value
@@ -19,25 +21,28 @@ type Props = {
     accountId: string;
     accounts: Account[];
     onClose: () => void;
+    /** Called after a refund changes balances. */
+    onChanged?: () => void;
 };
 
 /**
  * One transaction as the bank's books record it: the double-entry lines it posted on
  * the chart of accounts, and the seal in the tamper-evident hash chain that covers it.
  */
-export default function TransactionDetail({ token, transactionId, accountId, accounts, onClose }: Props) {
+export default function TransactionDetail({ token, transactionId, accountId, accounts, onClose, onChanged }: Props) {
     const [details, setDetails] = useState<TransactionDetails | null>(null);
     const [error, setError] = useState("");
 
+    const reload = useCallback(() => transactionDetails(token, transactionId), [token, transactionId]);
     useEffect(() => {
         let cancelled = false;
-        transactionDetails(token, transactionId)
+        reload()
             .then((d) => !cancelled && setDetails(d))
             .catch((e) => !cancelled && setError((e as Error).message));
         return () => {
             cancelled = true;
         };
-    }, [token, transactionId]);
+    }, [reload]);
 
     useEffect(() => {
         const close = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -63,6 +68,7 @@ export default function TransactionDetail({ token, transactionId, accountId, acc
                     </button>
                 </div>
                 {error && <div className="error" role="alert">{error}</div>}
+                {!details && !error && <Skeleton lines={8} />}
                 {details && line && (
                     <>
                         <div className={`drawer-amount ${line.amount >= 0 ? "amount-in" : "amount-out"}`}>
@@ -75,6 +81,20 @@ export default function TransactionDetail({ token, transactionId, accountId, acc
                             <dt>Transaction ID</dt>
                             <dd className="mono">{String(details.transaction.id)}</dd>
                         </dl>
+
+                        {details.refundable !== undefined &&
+                            accounts.some((a) => a.id === details.transaction.toAccountId) && (
+                                <Refund
+                                    token={token}
+                                    transactionId={transactionId}
+                                    refundable={Number(details.refundable)}
+                                    currency={String(details.transaction.currency)}
+                                    onRefunded={() => {
+                                        void reload().then(setDetails);
+                                        onChanged?.();
+                                    }}
+                                />
+                            )}
 
                         <h3><BookOpen size={16} /> Ledger entries</h3>
                         <p className="drawer-note">
@@ -139,5 +159,79 @@ export default function TransactionDetail({ token, transactionId, accountId, acc
                 )}
             </aside>
         </div>
+    );
+}
+
+/**
+ * The payee of a transfer can send all or part of it back. The refund is a new
+ * reversal transaction; the original is never edited.
+ */
+function Refund({ token, transactionId, refundable, currency, onRefunded }: {
+    token: string;
+    transactionId: string;
+    refundable: number;
+    currency: string;
+    onRefunded: () => void;
+}) {
+    const toast = useToast();
+    const [open, setOpen] = useState(false);
+    const [amount, setAmount] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState("");
+    // The same refund retried after an error keeps its key, so it cannot be paid twice.
+    const pending = useRef<{ amount: string; key: string } | null>(null);
+
+    if (refundable <= 0)
+        return <p className="refund-note"><RotateCcw size={14} /> Fully refunded.</p>;
+
+    async function submit(e: React.FormEvent) {
+        e.preventDefault();
+        const value = parseAmount(amount);
+        if (value === null) return setError("Enter a positive amount with up to two decimal places.");
+        if (value > refundable) return setError(`You can refund at most ${money(refundable, currency)}.`);
+        const key = pending.current?.amount === amount ? pending.current.key : crypto.randomUUID();
+        pending.current = { amount, key };
+        setBusy(true);
+        setError("");
+        try {
+            await refund(token, transactionId, value, key);
+            pending.current = null;
+            toast.success(`Refunded ${money(value, currency)}.`);
+            setOpen(false);
+            onRefunded();
+        } catch (err) {
+            setError((err as Error).message);
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    if (!open)
+        return (
+            <div className="refund-row">
+                <button type="button" className="outline" onClick={() => { setAmount(refundable.toFixed(2)); setOpen(true); }}>
+                    <RotateCcw size={15} /> Refund
+                </button>
+                <small>Up to {money(refundable, currency)} can be sent back.</small>
+            </div>
+        );
+
+    return (
+        <form className="refund-form" onSubmit={submit}>
+            <label>
+                Refund amount ({currency})
+                <input type="number" min="0.01" step="0.01" required value={amount} disabled={busy}
+                    onChange={(e) => setAmount(e.target.value)} />
+            </label>
+            <p className="drawer-note">
+                The money goes back to the sender as a new reversal transaction. The original transfer stays on the
+                ledger unchanged.
+            </p>
+            {error && <div className="error" role="alert">{error}</div>}
+            <div className="transfer-actions">
+                <button type="button" className="outline" disabled={busy} onClick={() => setOpen(false)}>Cancel</button>
+                <button type="submit" className="primary" disabled={busy}>{busy ? "Refunding…" : "Send refund"}</button>
+            </div>
+        </form>
     );
 }

@@ -1,723 +1,177 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-    Landmark,
-    LogOut,
-    RefreshCw,
-    Wallet,
-    ArrowDownLeft,
-    ArrowUpRight,
-    History,
-    ShieldCheck,
-    Clock,
-    BookOpen,
-} from "lucide-react";
-import Holds from "./Holds";
-import Ledger from "./Ledger";
-import TransactionDetail from "./TransactionDetail";
-import {
-    accounts,
-    deposit,
-    login,
-    transactions,
-    withdraw,
-    transferByAccountNumber,
-    roleOf,
-    type Account,
-    type Transaction,
-    type TransferReceipt
-} from './api';
-import { describe, money, signedMoney, totalsByCurrency, typeLabel } from "./format";
-const formatDate = (value: string): string => {
-    if (!value || value === "—") {
-        return "—";
+import { useCallback, useEffect, useState } from "react";
+import { accounts as fetchAccounts, ApiError, roleOf, transactions, type Account, type Transaction } from "./api";
+import { useRoute, type Route } from "./router";
+import Layout, { routesFor } from "./components/Layout";
+import TransactionDetail from "./components/TransactionDetail";
+import { ToastProvider, useToast } from "./components/Toasts";
+import Login from "./pages/Login";
+import Overview from "./pages/Overview";
+import Transactions from "./pages/Transactions";
+import Statement from "./pages/Statement";
+import Exchange from "./pages/Exchange";
+import Holds from "./pages/Holds";
+import Ledger from "./pages/Ledger";
+
+type Session = { token: string; email: string };
+const SESSION_KEY = "smartbank.session";
+
+/** True once the token's exp claim has passed (or it cannot be read). */
+export function isExpired(token: string, now = Date.now()): boolean {
+    try {
+        const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+        return typeof payload.exp === "number" && payload.exp * 1000 <= now;
+    } catch {
+        return true;
     }
+}
 
-    const date = new Date(value);
-
-    if (Number.isNaN(date.getTime())) {
-        return value;
+/**
+ * The session lives in sessionStorage, so a reload or a link to another page keeps you
+ * signed in, while closing the tab signs you out. The token is short-lived.
+ */
+function savedSession(): Session | null {
+    try {
+        const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) ?? "null") as Session | null;
+        return s && !isExpired(s.token) ? s : null;
+    } catch {
+        return null;
     }
+}
 
-    return new Intl.DateTimeFormat("en-CA", {
-        timeZone: "America/Toronto",
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-        hour12: true,
-    }).format(date);
-};
 export default function App() {
-    const [token, setToken] = useState<string | null>(null);
-    const [email, setEmail] = useState("demo.a@smartbank.local");
-    const [password, setPassword] = useState("");
+    return (
+        <ToastProvider>
+            <Bank />
+        </ToastProvider>
+    );
+}
+
+function Bank() {
+    const toast = useToast();
+    const [session, setSession] = useState<Session | null>(savedSession);
+    const [route, navigate] = useRoute();
     const [items, setItems] = useState<Account[]>([]);
+    const [loaded, setLoaded] = useState(false);
     const [selected, setSelected] = useState("");
-    const [history, setHistory] = useState<Transaction[]>([]);
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState("");
-    const [action, setAction] = useState<"deposit" | "withdraw">("deposit");
-    const [amount, setAmount] = useState("");
-    const [description, setDescription] = useState("");
-    const [destination, setDestination] = useState('');
-    const [transferAmount, setTransferAmount] = useState('');
-    type TransferDraft = { fromAccountId: string; fromAccountNumber: string; toAccountNumber: string; amount: number; currency: string; requestKey: string };
-    const [transferDraft, setTransferDraft] = useState<TransferDraft | null>(null);
-    const [transferReceipt, setTransferReceipt] = useState<{ transaction: TransferReceipt; from: string; to: string } | null>(null);
-    const [transferUncertain, setTransferUncertain] = useState(false);
-    const transferInFlight = useRef(false);
-    const pendingMoneyAction = useRef<{ action: string; accountId: string; amount: string; requestKey: string } | null>(null);
-    const [page, setPage] = useState<"overview" | "transactions" | "holds" | "ledger">("overview");
+    // Kept with the account it belongs to, so switching accounts shows a placeholder,
+    // not the previous account's transactions, while a reload after a change does not.
+    const [loadedHistory, setHistory] = useState<{ accountId: string; list: Transaction[] } | null>(null);
+    const history = loadedHistory?.accountId === selected ? loadedHistory.list : null;
+    const [refreshKey, setRefreshKey] = useState(0);
+    const [refreshing, setRefreshing] = useState(false);
     const [openTransaction, setOpenTransaction] = useState<string | null>(null);
+
+    const token = session?.token ?? null;
     const isAdmin = token !== null && roleOf(token) === "ADMIN";
-    const [filter, setFilter] = useState("all");
-    const [search, setSearch] = useState("");
-    const active = items.find((a) => a.id === selected);
-    const load = useCallback(async (t: string) => {
-        setLoading(true);
-        setError("");
-        try {
-            const list = await accounts(t);
-            setItems(list);
-            setSelected((prev) =>
-                list.some((a) => a.id === prev) ? prev : (list[0]?.id ?? ""),
-            );
-        } catch (e) {
-            setError((e as Error).message);
-            if ((e as Error).message.includes("401")) setToken(null);
-        } finally {
-            setLoading(false);
-        }
+
+    const logout = useCallback(() => {
+        try { sessionStorage.removeItem(SESSION_KEY); } catch { /* storage unavailable */ }
+        setSession(null);
+        setItems([]);
+        setLoaded(false);
+        setHistory(null);
+        setSelected("");
+        setOpenTransaction(null);
     }, []);
+
+    const fail = useCallback((e: unknown) => {
+        if (e instanceof ApiError && e.status === 401) {
+            logout();
+            toast.error("Your session has ended. Sign in again.");
+        } else toast.error((e as Error).message);
+    }, [logout, toast]);
+
+    const load = useCallback(async () => {
+        if (!token || isAdmin) return;
+        setRefreshing(true);
+        try {
+            const list = await fetchAccounts(token);
+            setItems(list);
+            setSelected((prev) => (list.some((a) => a.id === prev) ? prev : (list[0]?.id ?? "")));
+            setLoaded(true);
+        } catch (e) {
+            fail(e);
+        } finally {
+            setRefreshing(false);
+        }
+    }, [token, isAdmin, fail]);
+
     useEffect(() => {
-        if (token) void load(token);
-    }, [token, load]);
+        void load();
+    }, [load]);
+
+    // The selected account's transactions, reloaded whenever balances may have changed.
     useEffect(() => {
         if (!token || !selected) {
-            setHistory([]);
+            setHistory(null);
             return;
         }
         let cancelled = false;
         transactions(token, selected)
-            .then((v) => {
-                if (!cancelled) setHistory(v);
-            })
-            .catch((e) => {
-                if (!cancelled) setError((e as Error).message);
-            });
+            .then((list) => !cancelled && setHistory({ accountId: selected, list }))
+            .catch((e) => !cancelled && fail(e));
         return () => {
             cancelled = true;
         };
-    }, [token, selected, items]);
-    async function submitLogin(e: React.FormEvent) {
-        e.preventDefault();
-        setLoading(true);
-        setError("");
-        try {
-            const r = await login(email, password);
-            setToken(r.accessToken);
-            // Administrators have no accounts of their own; they start on the bank's books.
-            setPage(roleOf(r.accessToken) === "ADMIN" ? "ledger" : "overview");
-            setPassword("");
-        } catch (e) {
-            setError((e as Error).message);
-        } finally {
-            setLoading(false);
-        }
+    }, [token, selected, items, fail]);
+
+    // Customers bank; administrators read the books. Send each to a page they can use.
+    const allowed = routesFor(isAdmin);
+    useEffect(() => {
+        const routes = routesFor(isAdmin);
+        if (token && !routes.includes(route)) navigate(routes[0], true);
+    }, [token, isAdmin, route, navigate]);
+
+    function signedIn(newToken: string, email: string) {
+        const s = { token: newToken, email };
+        try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch { /* storage unavailable */ }
+        setSession(s);
+        navigate(roleOf(newToken) === "ADMIN" ? "ledger" : "overview", true);
     }
-    async function submitAction(e: React.FormEvent) {
-        e.preventDefault();
-        if (!token || !selected) return;
-        const value = Number(amount);
-        if (
-            !Number.isFinite(value) ||
-            value <= 0 ||
-            !/^\d+(\.\d{1,2})?$/.test(amount)
-        ) {
-            setError("Enter a positive amount with up to two decimal places.");
-            return;
-        }
-        // Reuse the key when the user retries the exact same failed operation, so a
-        // request that reached the server before the error is not posted twice.
-        const last = pendingMoneyAction.current;
-        const requestKey =
-            last && last.action === action && last.accountId === selected && last.amount === amount
-                ? last.requestKey
-                : crypto.randomUUID();
-        pendingMoneyAction.current = { action, accountId: selected, amount, requestKey };
-        setLoading(true);
-        setError("");
-        try {
-            if (action === "deposit")
-                await deposit(token, selected, value, description, requestKey);
-            else await withdraw(token, selected, value, description, requestKey);
-            pendingMoneyAction.current = null;
-            setAmount("");
-            setDescription("");
-            await load(token);
-        } catch (e) {
-            setError((e as Error).message);
-        } finally {
-            setLoading(false);
-        }
+
+    function refresh() {
+        setRefreshKey((k) => k + 1);
+        void load();
     }
-    function submitTransfer(e: React.FormEvent) {
-        e.preventDefault();
-        if (!token || !active || loading || transferDraft) return;
-        const value = Number(transferAmount);
-        const target = destination.trim();
-        if (!/^\d+(\.\d{1,2})?$/.test(transferAmount) || !Number.isFinite(value) || value <= 0) {
-            setError('Enter a positive amount with up to two decimal places.');
-            return;
-        }
-        if (!target) { setError('Enter a destination account number.'); return; }
-        if (active.accountNumber.toUpperCase() === target.toUpperCase()) {
-            setError('Source and destination accounts must differ.');
-            return;
-        }
-        if (value > Number(active.availableBalance ?? active.balance)) {
-            setError('The amount exceeds your available balance.');
-            return;
-        }
-        setError('');
-        setTransferReceipt(null);
-        setTransferUncertain(false);
-        setTransferDraft({
-            fromAccountId: active.id,
-            fromAccountNumber: active.accountNumber,
-            toAccountNumber: target,
-            amount: value,
-            currency: active.currency,
-            requestKey: crypto.randomUUID()
-        });
-    }
-    async function confirmTransfer() {
-        if (!token || !transferDraft || transferInFlight.current) return;
-        transferInFlight.current = true;
-        const draft = transferDraft;
-        setLoading(true);
-        setError('');
-        try {
-            const receipt = await transferByAccountNumber(
-                token, draft.fromAccountId, draft.toAccountNumber, draft.amount, draft.requestKey
-            );
-            setTransferReceipt({ transaction: receipt, from: draft.fromAccountNumber, to: draft.toAccountNumber });
-            setTransferDraft(null);
-            setTransferUncertain(false);
-            setDestination('');
-            setTransferAmount('');
-            await load(token);
-        } catch (e) {
-            setTransferUncertain(true);
-            setError(`${(e as Error).message}. If the request may have reached the server, check transaction history. Retry here uses the SAME request key.`);
-        } finally {
-            transferInFlight.current = false;
-            setLoading(false);
-        }
-    }
-    function logout() {
-        setPage("overview");
-        setToken(null);
-        setItems([]);
-        setHistory([]);
-        setSelected("");
-        setError("");
-        setTransferDraft(null);
-        setTransferReceipt(null);
-        setTransferUncertain(false);
-    }
-    if (!token)
-        return (
-            <main className="login-page">
-                <section className="login-card">
-                    <div className="brand">
-                        <Landmark size={28} /> SmartBank
-                    </div>
-                    <div className="eyebrow">CUSTOMER PORTAL</div>
-                    <h1>Welcome back</h1>
-                    <p>Sign in to view your accounts and manage your money.</p>
-                    <form onSubmit={submitLogin}>
-                        <label>
-                            Email address
-                            <input
-                                autoComplete="username"
-                                type="email"
-                                required
-                                value={email}
-                                onChange={(e) => setEmail(e.target.value)}
-                            />
-                        </label>
-                        <label>
-                            Password
-                            <input
-                                autoComplete="current-password"
-                                type="password"
-                                required
-                                value={password}
-                                onChange={(e) => setPassword(e.target.value)}
-                                placeholder="Enter your demo password"
-                            />
-                        </label>
-                        {error && (
-                            <div className="error" role="alert">
-                                {error}
-                            </div>
-                        )}
-                        <button disabled={loading}>
-                            {loading ? "Signing in…" : "Sign in securely"}
-                        </button>
-                    </form>
-                    <div className="fine">
-                        <ShieldCheck size={16} /> Demo environment · No real
-                        funds
-                    </div>
-                </section>
-            </main>
-        );
+
+    if (!token || !session) return <Login onLogin={signedIn} />;
+
+    const changed = () => void load();
+    const page: Record<Route, React.ReactNode> = {
+        overview: (
+            <Overview token={token} accounts={items} loaded={loaded} selected={selected} onSelect={setSelected}
+                history={history} onChanged={changed} onOpenTransaction={setOpenTransaction} />
+        ),
+        transactions: (
+            <Transactions accounts={items} selected={selected} onSelect={setSelected} history={history}
+                onOpenTransaction={setOpenTransaction} />
+        ),
+        statement: (
+            <Statement token={token} accounts={items} selected={selected} onSelect={setSelected}
+                refreshKey={refreshKey} onOpenTransaction={setOpenTransaction} />
+        ),
+        exchange: <Exchange key={refreshKey} token={token} accounts={items} onChanged={changed} />,
+        holds: (
+            <Holds key={refreshKey} token={token} accounts={items} selected={selected} onSelect={setSelected}
+                onChanged={load} />
+        ),
+        ledger: <Ledger key={refreshKey} token={token} />,
+    };
+
     return (
-        <div className="shell">
-            <aside>
-                <div className="brand">
-                    <Landmark size={27} /> SmartBank
-                </div>
-                <button
-                    type="button"
-                    className={`nav ${page === "overview" ? "active" : ""}`}
-                    onClick={() => setPage("overview")}
-                >
-                    <Wallet size={19} /> Overview
-                </button>
-                <button
-                    type="button"
-                    className={`nav ${page === "transactions" ? "active" : ""}`}
-                    onClick={() => setPage("transactions")}
-                >
-                    <History size={19} /> Transactions
-                </button>
-                <button
-                    type="button"
-                    className={`nav ${page === "holds" ? "active" : ""}`}
-                    onClick={() => setPage("holds")}
-                >
-                    <Clock size={19} /> Holds
-                </button>
-                {isAdmin && (
-                    <button
-                        type="button"
-                        className={`nav ${page === "ledger" ? "active" : ""}`}
-                        onClick={() => setPage("ledger")}
-                    >
-                        <BookOpen size={19} /> Ledger
-                    </button>
-                )}
-                <div className="side-bottom">
-                    <span>Signed in as</span>
-                    <strong>{email}</strong>
-                    <button className="ghost" onClick={logout}>
-                        <LogOut size={17} /> Sign out
-                    </button>
-                </div>
-            </aside>
-            {/* On phones the sidebar is hidden; this bar takes its place. */}
-            <nav className="tabbar" aria-label="Main">
-                <button type="button" className={page === "overview" ? "active" : ""} onClick={() => setPage("overview")}>
-                    <Wallet size={20} /> <span>Overview</span>
-                </button>
-                <button type="button" className={page === "transactions" ? "active" : ""} onClick={() => setPage("transactions")}>
-                    <History size={20} /> <span>Transactions</span>
-                </button>
-                <button type="button" className={page === "holds" ? "active" : ""} onClick={() => setPage("holds")}>
-                    <Clock size={20} /> <span>Holds</span>
-                </button>
-                {isAdmin && (
-                    <button type="button" className={page === "ledger" ? "active" : ""} onClick={() => setPage("ledger")}>
-                        <BookOpen size={20} /> <span>Ledger</span>
-                    </button>
-                )}
-                <button type="button" onClick={logout}>
-                    <LogOut size={20} /> <span>Sign out</span>
-                </button>
-            </nav>
-            <style>{`
-                .transfer-details { display:grid; grid-template-columns: 120px minmax(0,1fr); gap: 12px; margin: 20px 0; }
-                .transfer-details dt { color:#64748b; }
-                .transfer-details dd { margin:0; overflow-wrap:anywhere; }
-                .transfer-actions { display:flex; gap:12px; flex-wrap:wrap; }
-                .receipt-id { font-family:monospace; font-size:0.9em; }
-                @media print {
-                    body * { visibility:hidden !important; }
-                    .transfer-receipt, .transfer-receipt * { visibility:visible !important; }
-                    .transfer-receipt { position:absolute; left:0; top:0; width:100%; box-shadow:none !important; border:0 !important; }
-                    .transfer-receipt button { display:none !important; }
-                }
-            `}</style>
-            <main className="content">
-                <header>
-                    <div>
-                        <div className="eyebrow">PERSONAL BANKING</div>
-                        <h1>
-                            {page === "overview"
-                                ? "Your accounts"
-                                : page === "holds"
-                                    ? "Holds"
-                                    : page === "ledger"
-                                        ? "Ledger"
-                                        : "Transactions"}
-                        </h1>
-                        <p>
-                            {page === "overview"
-                                ? "Welcome to your SmartBank dashboard."
-                                : page === "holds"
-                                    ? "Reserve money now, settle it later."
-                                    : page === "ledger"
-                                        ? "The bank's books, and proof they have not been rewritten."
-                                        : "Review activity for your selected account. Select one to see its ledger entries."}
-                        </p>
-                    </div>
-                    <button
-                        className="outline"
-                        onClick={() => void load(token)}
-                        disabled={loading}
-                    >
-                        <RefreshCw size={16} /> Refresh
-                    </button>
-                </header>
-                {error && (
-                    <div className="error" role="alert">
-                        {error}
-                    </div>
-                )}
-                {page === "overview" && (
-                    <>
-                        <div className="summary">
-                            <div className="eyebrow">
-                                TOTAL AVAILABLE BALANCE
-                            </div>
-                            {(() => {
-                                const totals = totalsByCurrency(items);
-                                const [main, ...rest] = totals;
-                                return (
-                                    <>
-                                        <div className="big-balance">
-                                            {main ? money(main.total, main.currency) : money(0, "CAD")}
-                                            {main && <span className="big-currency"> {main.currency}</span>}
-                                        </div>
-                                        {rest.map((t) => (
-                                            <div className="other-balance" key={t.currency}>
-                                                + {money(t.total, t.currency)} {t.currency}
-                                            </div>
-                                        ))}
-                                        <div className="muted">
-                                            Across {items.length} account{items.length === 1 ? "" : "s"}
-                                            {totals.length > 1 ? ` in ${totals.length} currencies, shown separately` : ""}
-                                        </div>
-                                    </>
-                                );
-                            })()}
-                        </div>
-                        <h2>My accounts</h2>
-                        <div className="account-grid">
-                            {items.map((a) => (
-                                <button
-                                    key={a.id}
-                                    onClick={() => setSelected(a.id)}
-                                    className={`account-card ${selected === a.id ? "selected" : ""}`}
-                                >
-                                    <div className="account-top">
-                                        <span>{a.accountType}</span>
-                                        <Wallet size={21} />
-                                    </div>
-                                    <strong>
-                                        {money(Number(a.availableBalance ?? a.balance), a.currency)}
-                                    </strong>
-                                    <span>{a.accountNumber}</span>
-                                    {(Number(a.pendingDebits) > 0 || Number(a.pendingCredits) > 0) && (
-                                        <small className="pending-line">
-                                            {Number(a.pendingDebits) > 0 && `${money(Number(a.pendingDebits), a.currency)} reserved by holds`}
-                                            {Number(a.pendingDebits) > 0 && Number(a.pendingCredits) > 0 && " · "}
-                                            {Number(a.pendingCredits) > 0 && `${money(Number(a.pendingCredits), a.currency)} incoming`}
-                                        </small>
-                                    )}
-                                    <small>{a.ownerName}</small>
-                                </button>
-                            ))}
-                            {items.length === 0 && !loading && (
-                                <p>No accounts are available.</p>
-                            )}
-                        </div>
-                        {active && (
-                            <div className="lower">
-                                <section className="panel">
-                                    <h2>Move money</h2>
-                                    <p>
-                                        Deposit or withdraw from your selected
-                                        account.
-                                    </p>
-                                    <div className="tabs">
-                                        <button
-                                            className={
-                                                action === "deposit"
-                                                    ? "chosen"
-                                                    : ""
-                                            }
-                                            onClick={() => setAction("deposit")}
-                                        >
-                                            <ArrowDownLeft size={16} /> Deposit
-                                        </button>
-                                        <button
-                                            className={
-                                                action === "withdraw"
-                                                    ? "chosen"
-                                                    : ""
-                                            }
-                                            onClick={() =>
-                                                setAction("withdraw")
-                                            }
-                                        >
-                                            <ArrowUpRight size={16} /> Withdraw
-                                        </button>
-                                    </div>
-                                    <form onSubmit={submitAction}>
-                                        <label>
-                                            Amount ({active.currency})
-                                            <input
-                                                type="number"
-                                                min="0.01"
-                                                step="0.01"
-                                                required
-                                                value={amount}
-                                                onChange={(e) =>
-                                                    setAmount(e.target.value)
-                                                }
-                                                placeholder="0.00"
-                                            />
-                                        </label>
-                                        <label>
-                                            Description
-                                            <input
-                                                value={description}
-                                                onChange={(e) =>
-                                                    setDescription(
-                                                        e.target.value,
-                                                    )
-                                                }
-                                                placeholder="Optional note"
-                                            />
-                                        </label>
-                                        <button disabled={loading}>
-                                            {loading
-                                                ? "Processing…"
-                                                : action === "deposit"
-                                                    ? "Make deposit"
-                                                    : "Make withdrawal"}
-                                        </button>
-                                    </form>
-                                    <p className="fine">
-                                        Only use demo accounts. Backend
-                                        validates ownership and available funds.
-                                    </p>
-                                </section>
-                                <section className="panel">
-                                    <h2>Recent transactions</h2>
-                                    <p>Activity for {active.accountNumber}</p>
-                                    <div className="tx-list">
-                                        {history.length === 0 ? (
-                                            <div className="empty">
-                                                No transactions to display.
-                                            </div>
-                                        ) : (
-                                            history.slice(0, 12).map((t, i) => {
-                                                const line = describe(t, active.id, items);
-                                                return (
-                                                    <div className="tx clickable" key={String(t.id ?? i)} role="button" tabIndex={0}
-                                                        onClick={() => setOpenTransaction(String(t.id))}
-                                                        onKeyDown={(e) => e.key === "Enter" && setOpenTransaction(String(t.id))}>
-                                                        <span className="tx-text">
-                                                            <span className="tx-label">{line.label}</span>
-                                                            <small>{[line.detail, formatDate(String(t.createdAt ?? ""))].filter(Boolean).join(" · ")}</small>
-                                                        </span>
-                                                        <strong className={line.amount >= 0 ? "amount-in" : "amount-out"}>
-                                                            {signedMoney(line.amount, line.currency)}
-                                                        </strong>
-                                                    </div>
-                                                );
-                                            })
-                                        )}
-                                    </div>
-                                </section>
-                            </div>
-                        )}
-                        {active && (
-                            <section className="panel" style={{ marginTop: 20 }}>
-                                <h2>Transfer Money</h2>
-                                <p>Send money from {active.accountNumber} to another demo account.</p>
-                                <form onSubmit={submitTransfer}>
-                                    <label>From account
-                                        <input value={`${active.accountNumber} (${active.currency})`} disabled />
-                                    </label>
-                                    <label>Destination account number
-                                        <input required value={destination} disabled={!!transferDraft || loading}
-                                            onChange={e => setDestination(e.target.value)} placeholder="e.g. DEMO-10001" />
-                                    </label>
-                                    <label>Amount ({active.currency})
-                                        <input type="number" min="0.01" step="0.01" required
-                                            value={transferAmount} disabled={!!transferDraft || loading}
-                                            onChange={e => setTransferAmount(e.target.value)} placeholder="0.00" />
-                                    </label>
-                                    <button type="submit" disabled={loading || !!transferDraft}>Review transfer</button>
-                                </form>
-                                <p className="fine">Demo transfers only. The backend validates ownership and available funds.</p>
-                            </section>
-                        )}
-                        {transferDraft && (
-                            <section className="panel" style={{ marginTop: 20 }} aria-label="Transfer confirmation">
-                                <h2>Confirm your transfer</h2>
-                                <p>Review these details before sending. No money has moved yet.</p>
-                                <dl className="transfer-details">
-                                    <dt>From</dt><dd>{transferDraft.fromAccountNumber}</dd>
-                                    <dt>To</dt><dd>{transferDraft.toAccountNumber}</dd>
-                                    <dt>Amount</dt><dd><strong>{money(transferDraft.amount, transferDraft.currency)}</strong></dd>
-                                </dl>
-                                {transferUncertain && <p role="alert">The previous attempt's outcome is uncertain. Check Transactions before retrying. Retrying uses the same request key.</p>}
-                                <div className="transfer-actions">
-                                    {!transferUncertain && <button type="button" className="outline" disabled={loading}
-                                        onClick={() => setTransferDraft(null)}>Edit / Cancel</button>}
-                                    <button type="button" disabled={loading} onClick={() => void confirmTransfer()}>
-                                        {loading ? 'Processing…' : transferUncertain ? 'Retry same transfer' : 'Confirm transfer'}
-                                    </button>
-                                </div>
-                            </section>
-                        )}
-                        {transferReceipt && (
-                            <section className="panel transfer-receipt" style={{ marginTop: 20 }} aria-label="Transfer receipt" role="status">
-                                <h2>✓ Transfer completed</h2>
-                                <p>SmartBank demo transaction receipt</p>
-                                <h2>{money(Number(transferReceipt.transaction.amount), transferReceipt.transaction.currency)}</h2>
-                                <dl className="transfer-details">
-                                    <dt>Status</dt><dd>Completed</dd>
-                                    <dt>From</dt><dd>{transferReceipt.from}</dd>
-                                    <dt>To</dt><dd>{transferReceipt.to}</dd>
-                                    <dt>Date</dt><dd>{formatDate(transferReceipt.transaction.createdAt)}</dd>
-                                    <dt>Transaction ID</dt><dd className="receipt-id">{transferReceipt.transaction.id}</dd>
-                                </dl>
-                                <p className="fine">Demo environment · No real funds</p>
-                                <button type="button" className="outline" onClick={() => window.print()}>Print receipt</button>
-                            </section>
-                        )}
-                    </>
-                )}
-                {page === "ledger" && isAdmin && token && <Ledger token={token} />}
-                {openTransaction && token && (
-                    <TransactionDetail
-                        token={token}
-                        transactionId={openTransaction}
-                        accountId={selected}
-                        accounts={items}
-                        onClose={() => setOpenTransaction(null)}
-                    />
-                )}
-                {page === "holds" && (
-                    <Holds
-                        token={token}
-                        accounts={items}
-                        selected={selected}
-                        onSelect={setSelected}
-                        onChanged={() => load(token)}
-                    />
-                )}
-                {page === "transactions" && (
-                    <section className="panel history-page">
-                        <div className="history-toolbar">
-                            <label>
-                                Account
-                                <select
-                                    value={selected}
-                                    onChange={(e) =>
-                                        setSelected(e.target.value)
-                                    }
-                                >
-                                    {items.map((a) => (
-                                        <option key={a.id} value={a.id}>
-                                            {a.accountNumber} · {a.accountType}
-                                        </option>
-                                    ))}
-                                </select>
-                            </label>
-                            <label>
-                                Type
-                                <select
-                                    value={filter}
-                                    onChange={(e) => setFilter(e.target.value)}
-                                >
-                                    <option value="all">All types</option>
-                                    {Array.from(
-                                        new Set(
-                                            history.map((t) =>
-                                                String(t.type ?? "UNKNOWN"),
-                                            ),
-                                        ),
-                                    ).map((t) => (
-                                        <option key={t} value={t}>
-                                            {typeLabel(t)}
-                                        </option>
-                                    ))}
-                                </select>
-                            </label>
-                            <label>
-                                Search
-                                <input
-                                    value={search}
-                                    onChange={(e) => setSearch(e.target.value)}
-                                    placeholder="Type or account number"
-                                />
-                            </label>
-                        </div>
-                        <div className="history-scroll">
-                            <table className="history-table">
-                                <thead>
-                                    <tr>
-                                        <th>Date</th>
-                                        <th>Type</th>
-                                        <th>Details</th>
-                                        <th className="amount-cell">Amount</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {history
-                                        .map((t) => ({ t, line: describe(t, selected, items) }))
-                                        .filter(
-                                            ({ t, line }) =>
-                                                (filter === "all" || String(t.type ?? "UNKNOWN") === filter) &&
-                                                `${line.label} ${line.detail}`.toLowerCase().includes(search.toLowerCase()),
-                                        )
-                                        .map(({ t, line }, i) => (
-                                            <tr key={String(t.id ?? i)} className="clickable" tabIndex={0}
-                                                onClick={() => setOpenTransaction(String(t.id))}
-                                                onKeyDown={(e) => e.key === "Enter" && setOpenTransaction(String(t.id))}>
-                                                <td className="date-cell">{formatDate(String(t.createdAt ?? t.timestamp ?? t.occurredAt ?? '—'))}</td>
-                                                <td className="type-cell">{line.label}</td>
-                                                <td className="detail-cell">{line.detail || "—"}</td>
-                                                <td className={`amount-cell ${line.amount >= 0 ? "amount-in" : "amount-out"}`}>
-                                                    {signedMoney(line.amount, line.currency)}
-                                                </td>
-                                            </tr>
-                                        ))}
-                                </tbody>
-                            </table>
-                            {history.length === 0 && (
-                                <div className="empty">
-                                    No transactions for this account.
-                                </div>
-                            )}
-                        </div>
-                    </section>
-                )}
-                <footer>
-                    SmartBank demo · React + Spring Boot · Not a real financial
-                    institution
-                </footer>
-            </main>
-        </div>
+        <Layout route={route} onNavigate={navigate} isAdmin={isAdmin} email={session.email} onLogout={logout}
+            onRefresh={refresh} refreshing={refreshing}>
+            {allowed.includes(route) && page[route]}
+            {openTransaction && (
+                <TransactionDetail
+                    token={token}
+                    transactionId={openTransaction}
+                    accountId={selected}
+                    accounts={items}
+                    onClose={() => setOpenTransaction(null)}
+                    onChanged={changed}
+                />
+            )}
+        </Layout>
     );
 }
