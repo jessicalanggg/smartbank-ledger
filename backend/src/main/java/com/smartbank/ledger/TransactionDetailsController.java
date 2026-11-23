@@ -4,11 +4,13 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.smartbank.auth.AccessService;
 import com.smartbank.transaction.BankingService;
 import com.smartbank.transaction.TransactionResponse;
+import com.smartbank.transaction.TransactionType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
@@ -38,8 +40,13 @@ public class TransactionDetailsController {
     public record SealInfo(long seq, Instant sealedAt, boolean signed,
                            @JsonInclude(JsonInclude.Include.NON_NULL) String keyId) { }
 
+    /**
+     * {@code refundable} is how much of a transfer its payee can still send back (the
+     * amount less any earlier refunds); absent for other transaction types.
+     */
     public record TransactionDetails(TransactionResponse transaction, List<ChartOfAccounts.JournalLine> journal,
-                                     SealInfo seal) { }
+                                     SealInfo seal,
+                                     @JsonInclude(JsonInclude.Include.NON_NULL) BigDecimal refundable) { }
 
     @GetMapping("/api/v1/transactions/{id}/details")
     public TransactionDetails details(@PathVariable UUID id) {
@@ -53,6 +60,9 @@ public class TransactionDetailsController {
                 (rs, n) -> new SealInfo(rs.getLong("seq"), rs.getTimestamp("sealed_at").toInstant(),
                         rs.getString("key_id") != null, rs.getString("key_id")), id)
                 .stream().findFirst().orElse(null);
-        return new TransactionDetails(tx, chart.journal(id), seal);
+        BigDecimal refundable = tx.type() != TransactionType.TRANSFER ? null : tx.amount().subtract(jdbc.queryForObject(
+                "SELECT COALESCE(SUM(amount), 0) FROM banking_transactions WHERE reverses_transaction_id = ?",
+                BigDecimal.class, id));
+        return new TransactionDetails(tx, chart.journal(id), seal, refundable);
     }
 }

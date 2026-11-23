@@ -29,7 +29,7 @@ All endpoints except health, login and register need `Authorization: Bearer <tok
 | `POST` | `/api/v1/transactions/{id}/reversals` | Optional `{ "amount" }`; without it, whatever is not yet reversed. Transfers: payee or admin. Deposits and withdrawals: admin |
 | `POST` | `/api/v1/transfers/linked` | `{ "transfers": [ { "fromAccountId", "toAccountId", "amount" }, … ] }`, 1–20 legs, all or nothing. Caller must own every source |
 | `GET` | `/api/v1/accounts/{id}/transactions` | Newest 100, owner only |
-| `GET` | `/api/v1/transactions/{id}/details` | The transaction, its debit and credit lines on the chart of accounts, and the seal covering it (`null` until sealed). Owner of either account, or admin |
+| `GET` | `/api/v1/transactions/{id}/details` | The transaction, its debit and credit lines on the chart of accounts, and the seal covering it (`null` until sealed); for transfers, `refundable` (what the payee can still send back). Owner of either account, or admin |
 | `POST` | `/api/v1/holds` | `{ "fromAccountId", "toAccountId", "amount", "expiresInSeconds"? }`. Caller must own the source |
 | `POST` | `/api/v1/holds/by-account-number` | `{ "fromAccountId", "toAccountNumber", "amount", "expiresInSeconds"? }` |
 | `GET` | `/api/v1/holds/{id}` | Payer or payee only |

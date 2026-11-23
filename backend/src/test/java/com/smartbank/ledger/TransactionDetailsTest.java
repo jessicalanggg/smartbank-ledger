@@ -26,6 +26,7 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 
 /** A customer's view of one transaction: its ledger lines and the seal covering it. */
 @ActiveProfiles("test")
@@ -105,5 +106,25 @@ class TransactionDetailsTest {
         // Cash and settlement is debited, the customer's deposit account credited.
         assertEquals(List.of("1000"), JsonPath.read(body, "$.journal[?(@.debit > 0)].code"));
         assertEquals(403, details(tx, payer).getStatus());
+        assertFalse(body.contains("refundable"), "Only transfers can be refunded by their payee");
+    }
+
+    @Test
+    void refundableShrinksAsThePayeeRefunds() throws Exception {
+        UUID tx = banking.transfer(new TransferRequest(from, to, new BigDecimal("40.00"), "det-" + UUID.randomUUID())).id();
+        assertEquals(40.0, refundable(tx));
+
+        int status = mvc.perform(post("/api/v1/transactions/" + tx + "/reversals")
+                        .with(jwt().jwt(j -> j.subject(payee.toString())))
+                        .contentType("application/json")
+                        .content("{\"amount\":15.00,\"requestKey\":\"ref-" + UUID.randomUUID() + "\"}"))
+                .andReturn().getResponse().getStatus();
+        assertEquals(201, status);
+        assertEquals(25.0, refundable(tx));
+    }
+
+    private double refundable(UUID tx) throws Exception {
+        Number n = JsonPath.read(details(tx, payee).getContentAsString(), "$.refundable");
+        return n.doubleValue();
     }
 }
