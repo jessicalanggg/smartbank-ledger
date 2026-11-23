@@ -120,7 +120,7 @@ A transfer is now: idempotency lookup, account read, the write, the balance batc
 
 All 84 tests pass with the new write path, including the model-based test (now the seeded simulation) and the network-cut and `kill -9` crash tests.
 
-**Throughput not re-measured.** The machine was under heavy unrelated load (load average ≈ 11 on 10 cores) when this was done, which makes throughput numbers unreliable. With the service time now dominated by about 6 instead of 17 round trips, the benchmark above should be re-run on a quiet machine.
+**Throughput** with this write path was re-measured on a quiet machine: the "Off" columns of the batched-posting results below are this path without batching, at about 700 transfers/s with every transfer paying one account.
 
 ## Batched posting (group commit)
 
@@ -138,18 +138,20 @@ Batches form on their own: while a worker posts one batch, new requests queue fo
 
 **A deadlock the tests found.** A batch locks accounts and then inserts request keys; the unbatched path inserts its key and then locks accounts. If the same key is in flight on both at once, each can wait for the other, and PostgreSQL aborts one. A test that forces exactly this showed the whole batch failing, unrelated transfers included. Now a batch that loses a deadlock (or hits a duplicate key) settles each transfer on the unbatched path, where the contested one is replayed and the others post, and a single transfer chosen as the victim retries. Either way both callers get the same transaction and the key posts once.
 
-**Results.** Interleaved runs (off, on, off, on), 3,000 transfers per row, 32 client threads, pool of 10. The machine was heavily loaded (load average 12–14), so absolute numbers are rough, but the gap held in both pairs:
+**Results.** Re-measured on 2026-11-22 on a quiet machine (on mains power, other apps and containers stopped; load average about 3.4 before the first run and 5–7.5 during them, most of it the benchmark itself). Interleaved runs (off, on, off, on), 3,000 transfers per row, 32 client threads, pool of 10, three runs per row with the median shown. The two runs of each setting agree closely:
 
 | Transfers into hot account | Off: transfers/s | On: transfers/s | Off: p99 ms | On: p99 ms |
 | --- | --- | --- | --- | --- |
-| 0% | 252 / 503 | 1,488 / 1,078 | 1,560 / 221 | 47 / 65 |
-| 25% | 210 / 179 | 1,723 / 827 | 4,158 / 1,175 | 43 / 158 |
-| 50% | 408 / 372 | 1,522 / 1,701 | 461 / 387 | 134 / 45 |
-| 75% | 689 / 448 | 1,874 / 1,767 | 181 / 263 | 47 / 42 |
-| 100% | 305 / 419 | 2,444 / 1,857 | 1,584 / 357 | 52 / 79 |
+| 0% | 949 / 1,090 | 1,912 / 1,903 | 133 / 99 | 26 / 26 |
+| 25% | 1,240 / 1,224 | 1,930 / 2,072 | 106 / 105 | 29 / 28 |
+| 50% | 1,050 / 977 | 2,078 / 2,051 | 117 / 120 | 25 / 27 |
+| 75% | 825 / 833 | 1,949 / 2,085 | 155 / 152 | 40 / 26 |
+| 100% | 680 / 704 | 2,415 / 2,148 | 328 / 283 | 27 / 29 |
 
-- With every transfer paying one account, throughput is about **5–6× higher** and p99 latency falls from hundreds of milliseconds (or seconds) to under 80 ms.
-- Throughput no longer drops as traffic concentrates on one account. The hot case is now the fastest, because one row lock and one commit cover a whole batch of transfers into it.
+- With every transfer paying one account, batching gives about **3× the throughput** (≈700 → ≈2,100–2,400 transfers/s) and cuts p99 latency about **10×** (≈300 ms → under 30 ms).
+- Throughput no longer drops as traffic concentrates on one account: without batching it falls from about 1,000 to 700 transfers/s as the hot share rises; with batching it stays at about 2,000 or more, and the hot case is among the fastest, because one row lock and one commit cover a whole batch of transfers into it.
+- With no hot account, batching still roughly doubles throughput and cuts p99 about 4×, from sharing commits.
+- An earlier measurement on a heavily loaded machine (load average 12–14) reported 5–6×. Its unbatched baseline was depressed by the load (305–419 transfers/s at 100%, against about 700 here), which overstated the gain; the figures above replace it.
 
 **Verified** by the full suite running through the batcher (97 tests): the model-based test (now the seeded simulation), network-cut and `kill -9` crash tests, the 5,000-transfer and mixed hold/transfer concurrency tests, and batch tests for isolation of a rejected transfer, arrival-order decisions, duplicate keys inside a batch, replays, and the deadlock case above.
 

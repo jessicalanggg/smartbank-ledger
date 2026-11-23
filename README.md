@@ -35,7 +35,7 @@ flowchart LR
 | The whole chain rewritten by someone with full database access | Caught by seal signatures, with no external record | [`SealSignatureTest`](backend/src/test/java/com/smartbank/ledger/SealSignatureTest.java) |
 | The app's own database role tries to update, delete, truncate or disable triggers on history | All 17 attempts refused, while every operation still works | [`AppRoleTest`](backend/src/test/java/com/smartbank/security/AppRoleTest.java) |
 | Database round trips per transfer | 17 → 6, measured with injected network delay | [benchmarks](docs/benchmarks.md#round-trips-per-operation) |
-| Batched posting, every transfer paying one account | About 5–6× the throughput, p99 under 80 ms | [benchmarks](docs/benchmarks.md#batched-posting-group-commit) |
+| Batched posting (group commit), every transfer paying one account | About 3× the throughput (≈700 → ≈2,100+ transfers/s) and p99 latency ≈300 ms → under 30 ms, on a quiet machine | [benchmarks](docs/benchmarks.md#batched-posting-group-commit) |
 
 The test suite has over 200 tests; [docs/testing.md](docs/testing.md) lists what each group proves.
 
