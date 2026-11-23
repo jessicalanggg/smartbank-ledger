@@ -24,6 +24,9 @@ public class DemoUserBootstrap {
                         "33333333-3333-4333-8333-333333333333");  // USD account, for FX
                 create(users, accounts, encoder, "demo.b@smartbank.local", password,
                         "22222222-2222-4222-8222-222222222222");
+                // An administrator with no accounts, for the ledger view.
+                if (users.findByEmail("demo.admin@smartbank.local").isEmpty())
+                    users.saveAndFlush(AppUser.admin("demo.admin@smartbank.local", encoder.encode(password)));
             });
         };
     }

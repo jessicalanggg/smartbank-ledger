@@ -22,7 +22,9 @@ export async function request<T>(path: string, token: string | null, init: Reque
     throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
   }
   if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  // An endpoint that returns nothing (null) sends an empty body.
+  const text = await response.text();
+  return (text ? JSON.parse(text) : null) as T;
 }
 export function login(email: string, password: string) { return request<LoginResponse>('/auth/login', null, { method: 'POST', body: JSON.stringify({ email, password }) }); }
 export function accounts(token: string) { return request<Account[]>('/accounts', token); }
@@ -105,4 +107,39 @@ export function postHold(token: string, holdId: string, amount?: number) {
 /** Releases the hold. Only the payee can do this. */
 export function voidHold(token: string, holdId: string) {
   return request<Hold>(`/holds/${encodeURIComponent(holdId)}/void`, token, { method: 'POST' });
+}
+
+// The ledger behind a transaction, and the bank's books (administrators).
+export type JournalLine = { code: string; name: string; type: string; debit: number; credit: number; currency: string };
+export type SealInfo = { seq: number; sealedAt: string; signed: boolean; keyId?: string };
+export type TransactionDetails = { transaction: Transaction; journal: JournalLine[]; seal: SealInfo | null };
+export function transactionDetails(token: string, id: string) {
+  return request<TransactionDetails>(`/transactions/${encodeURIComponent(id)}/details`, token);
+}
+export type AccountBalance = {
+  id: string; code: string; name: string; type: string; normalBalance: string; currency: string;
+  parentId: string | null; customerAccountId: string | null; debits: number; credits: number; balance: number;
+};
+export type TrialBalance = {
+  currency: string; asOf: string; accounts: AccountBalance[]; totalDebits: number; totalCredits: number;
+  byType: { type: string; balance: number }[]; balanced: boolean; accountingEquationHolds: boolean;
+};
+export function trialBalance(token: string, currency: string) {
+  return request<TrialBalance>(`/ledger/trial-balance?currency=${encodeURIComponent(currency)}`, token);
+}
+export type Seal = { seq: number; prevHash: string; hash: string; transactionCount: number; sealedAt: string; keyId: string | null; signature: string | null };
+export type SealVerification = { sealsChecked: number; transactionsChecked: number; firstBrokenSeal: number | null; problem: string | null; headHash: string | null };
+export type PublishedKey = { keyId: string; algorithm: string; publicKey: string; current: boolean };
+export function sealHead(token: string) { return request<Seal | null>('/ledger/seals/head', token); }
+export function verifySeals(token: string) { return request<SealVerification>('/ledger/seals/verify', token); }
+export function sealPublicKeys(token: string) { return request<PublishedKey[]>('/ledger/seals/public-keys', token); }
+
+/** The role in the signed-in user's token (CUSTOMER or ADMIN). Display only; the server enforces it. */
+export function roleOf(token: string): string {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+    return String(payload.role ?? 'CUSTOMER');
+  } catch {
+    return 'CUSTOMER';
+  }
 }

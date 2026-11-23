@@ -59,7 +59,7 @@ aside .side-bottom{margin-top:auto}
 /* Phones: a bottom tab bar replaces the hidden sidebar */
 .tabbar{display:none}
 @media(max-width:520px){
-  .tabbar{display:grid;grid-template-columns:repeat(4,1fr);position:fixed;left:0;right:0;bottom:0;z-index:20;background:#fff;border-top:1px solid #e6ebf2;padding:6px 4px calc(6px + env(safe-area-inset-bottom));box-shadow:0 -6px 18px #1c3e7d12}
+  .tabbar{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;position:fixed;left:0;right:0;bottom:0;z-index:20;background:#fff;border-top:1px solid #e6ebf2;padding:6px 4px calc(6px + env(safe-area-inset-bottom));box-shadow:0 -6px 18px #1c3e7d12}
   .tabbar button{display:flex;flex-direction:column;align-items:center;gap:3px;border:0;background:transparent;color:#7c89a4;font-size:11px;font-weight:600;padding:6px 2px;border-radius:9px}
   .tabbar button.active{color:#225ac8;background:#eaf1ff}
   .content{padding-bottom:96px}
@@ -73,4 +73,62 @@ aside .side-bottom{margin-top:auto}
   .history-table .detail-cell{grid-area:detail;font-size:12px}
   .history-table .date-cell{grid-area:date;font-size:12px;color:#8791a3}
   .history-table .amount-cell{grid-area:amount;align-self:center}
+}
+
+/* Clickable transactions */
+.clickable{cursor:pointer}
+.tx.clickable:hover,.history-table tr.clickable:hover{background:#f6f8fc}
+.tx.clickable{margin:0 -10px;padding-left:10px;padding-right:10px;border-radius:8px}
+
+/* Transaction detail drawer */
+.drawer-backdrop{position:fixed;inset:0;background:#0f1b3366;z-index:50;display:flex;justify-content:flex-end}
+.drawer{width:min(520px,100%);height:100%;overflow-y:auto;background:#fff;padding:26px 28px 40px;box-shadow:-20px 0 50px #0f1b3333;display:block}
+.drawer-head{display:flex;justify-content:space-between;align-items:flex-start}
+.drawer-head h2{margin:6px 0 0}
+.icon-button{border:1px solid #dce3ee;background:#fff;border-radius:8px;padding:7px;display:flex;color:#324b75}
+.drawer-amount{font-size:32px;font-weight:700;margin:18px 0 6px}
+.drawer-facts{display:grid;grid-template-columns:120px 1fr;gap:8px 12px;font-size:13px;margin:14px 0 6px}
+.drawer-facts dt{color:#77849a}
+.drawer-facts dd{margin:0;overflow-wrap:anywhere}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.drawer h3{display:flex;align-items:center;gap:8px;font-size:15px;margin:26px 0 6px}
+.drawer-note{color:#758198;font-size:13px;line-height:1.5;margin:0 0 10px}
+.journal{width:100%;border-collapse:collapse;font-size:13px}
+.journal th{text-align:left;color:#77849a;font-weight:600;background:#f6f8fc;padding:9px 10px}
+.journal td{padding:10px;border-bottom:1px solid #edf0f5;vertical-align:top}
+.journal td small{display:block;color:#8791a3;font-size:11px;margin-top:2px}
+.journal tfoot td{font-weight:700;border-bottom:0}
+.num{text-align:right;white-space:nowrap}
+.code{display:inline-block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#225ac8;background:#eef3ff;border-radius:5px;padding:1px 6px;margin-right:4px}
+.seal-box{display:flex;gap:12px;align-items:flex-start;border-radius:10px;padding:14px;font-size:13px}
+.seal-box div{display:flex;flex-direction:column;gap:4px}
+.seal-box small{color:#5d6b82;line-height:1.5}
+.seal-box.ok{background:#ecfdf3;border:1px solid #abefc6;color:#067647}
+.seal-box.ok strong{color:#05603a}
+.seal-box.pending{background:#fff6e5;border:1px solid #fedf89;color:#b54708}
+
+/* Ledger page */
+.ledger-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.inline-select{display:flex;align-items:center;gap:10px;margin:0;font-size:13px}
+.inline-select select{width:auto;margin:0;padding:8px 10px}
+.checks{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0 4px}
+.check{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;border-radius:9px;padding:9px 12px}
+.check.ok{background:#ecfdf3;color:#067647}
+.check.bad{background:#fff0f0;color:#a61b29}
+.ledger-table tr.child td:first-child{padding-left:30px;color:#5d6b82}
+.ledger-table .strong{font-weight:700}
+.ledger-table tfoot td{font-weight:700;background:#f6f8fc}
+.balance-strip small{display:block;color:#8791a3;font-size:12px;margin-top:4px}
+.balance-strip dt{display:flex;align-items:center;gap:5px}
+.balance-strip dd.small-dd{font-size:15px}
+.verify-row{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:18px}
+@media(max-width:520px){
+  .drawer{padding:20px 18px 32px}
+  .drawer-facts{grid-template-columns:1fr}
+  .ledger-table thead{display:table-header-group}
+  .ledger-table tr{display:table-row}
+  .ledger-table td{display:table-cell;padding:10px 8px}
+  /* Phones: account and balance only; the totals are in the checks above */
+  .ledger-table th:nth-child(n+2):nth-child(-n+4),.ledger-table td:nth-child(n+2):nth-child(-n+4),.ledger-table tfoot{display:none}
+  .ledger-table tr.child td:first-child{padding-left:18px}
 }

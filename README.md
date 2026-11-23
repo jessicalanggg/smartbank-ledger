@@ -52,7 +52,7 @@ Same request, same key      → 201, byte-identical body, Idempotent-Replayed: t
 Same key, different request → 422
 ```
 
-The frontend covers accounts, history, deposits, withdrawals, transfers by account number, and holds (place, capture in full or in part, release).
+The frontend covers accounts (with a total per currency), history, deposits, withdrawals, transfers by account number, and holds (place, capture in full or in part, release). Selecting a transaction shows the debit and credit lines it posted and the signed seal that covers it. Administrators get a **Ledger** page: the trial balance for each currency with its debits = credits and accounting-equation checks, and a **Verify history** button that rechecks the whole signed hash chain. It works on phones too, with a bottom tab bar.
 
 ## Features
 
@@ -88,7 +88,7 @@ Start the frontend (`http://localhost:5173`, proxies `/api` to the backend):
 cd frontend && npm install && npm run dev
 ```
 
-Log in as `demo.a@smartbank.local` or `demo.b@smartbank.local` with the local demo password set in `infra/compose.yml`. Demo user A owns `DEMO-10001` (CAD) and `DEMO-10003` (USD, for trying FX); demo user B owns `DEMO-10002` (CAD). Demonstration CAD/USD rates are seeded.
+Log in as `demo.a@smartbank.local` or `demo.b@smartbank.local` (customers), or `demo.admin@smartbank.local` (the Ledger page), with the local demo password set in `infra/compose.yml`. Demo user A owns `DEMO-10001` (CAD) and `DEMO-10003` (USD, for trying FX); demo user B owns `DEMO-10002` (CAD). Demonstration CAD/USD rates are seeded.
 
 Stop without deleting data with `docker compose -f infra/compose.yml down`. Adding `-v` deletes the database volume.
 

@@ -11,6 +11,12 @@ public class AppUser {
     @Column(nullable = false, length = 20) private String role = "CUSTOMER";
     protected AppUser() {}
     public AppUser(String email, String passwordHash) { this.email = email; this.passwordHash = passwordHash; }
+    /** An administrator: can read the bank's books, charge fees and reverse deposits and withdrawals. */
+    public static AppUser admin(String email, String passwordHash) {
+        AppUser user = new AppUser(email, passwordHash);
+        user.role = "ADMIN";
+        return user;
+    }
     public UUID getId() { return id; }
     public String getEmail() { return email; }
     public String getPasswordHash() { return passwordHash; }

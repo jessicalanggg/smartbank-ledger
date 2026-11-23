@@ -9,8 +9,11 @@ import {
     History,
     ShieldCheck,
     Clock,
+    BookOpen,
 } from "lucide-react";
 import Holds from "./Holds";
+import Ledger from "./Ledger";
+import TransactionDetail from "./TransactionDetail";
 import {
     accounts,
     deposit,
@@ -18,6 +21,7 @@ import {
     transactions,
     withdraw,
     transferByAccountNumber,
+    roleOf,
     type Account,
     type Transaction,
     type TransferReceipt
@@ -64,7 +68,9 @@ export default function App() {
     const [transferUncertain, setTransferUncertain] = useState(false);
     const transferInFlight = useRef(false);
     const pendingMoneyAction = useRef<{ action: string; accountId: string; amount: string; requestKey: string } | null>(null);
-    const [page, setPage] = useState<"overview" | "transactions" | "holds">("overview");
+    const [page, setPage] = useState<"overview" | "transactions" | "holds" | "ledger">("overview");
+    const [openTransaction, setOpenTransaction] = useState<string | null>(null);
+    const isAdmin = token !== null && roleOf(token) === "ADMIN";
     const [filter, setFilter] = useState("all");
     const [search, setSearch] = useState("");
     const active = items.find((a) => a.id === selected);
@@ -111,6 +117,8 @@ export default function App() {
         try {
             const r = await login(email, password);
             setToken(r.accessToken);
+            // Administrators have no accounts of their own; they start on the bank's books.
+            setPage(roleOf(r.accessToken) === "ADMIN" ? "ledger" : "overview");
             setPassword("");
         } catch (e) {
             setError((e as Error).message);
@@ -294,6 +302,15 @@ export default function App() {
                 >
                     <Clock size={19} /> Holds
                 </button>
+                {isAdmin && (
+                    <button
+                        type="button"
+                        className={`nav ${page === "ledger" ? "active" : ""}`}
+                        onClick={() => setPage("ledger")}
+                    >
+                        <BookOpen size={19} /> Ledger
+                    </button>
+                )}
                 <div className="side-bottom">
                     <span>Signed in as</span>
                     <strong>{email}</strong>
@@ -313,6 +330,11 @@ export default function App() {
                 <button type="button" className={page === "holds" ? "active" : ""} onClick={() => setPage("holds")}>
                     <Clock size={20} /> <span>Holds</span>
                 </button>
+                {isAdmin && (
+                    <button type="button" className={page === "ledger" ? "active" : ""} onClick={() => setPage("ledger")}>
+                        <BookOpen size={20} /> <span>Ledger</span>
+                    </button>
+                )}
                 <button type="button" onClick={logout}>
                     <LogOut size={20} /> <span>Sign out</span>
                 </button>
@@ -339,14 +361,18 @@ export default function App() {
                                 ? "Your accounts"
                                 : page === "holds"
                                     ? "Holds"
-                                    : "Transactions"}
+                                    : page === "ledger"
+                                        ? "Ledger"
+                                        : "Transactions"}
                         </h1>
                         <p>
                             {page === "overview"
                                 ? "Welcome to your SmartBank dashboard."
                                 : page === "holds"
                                     ? "Reserve money now, settle it later."
-                                    : "Review activity for your selected account."}
+                                    : page === "ledger"
+                                        ? "The bank's books, and proof they have not been rewritten."
+                                        : "Review activity for your selected account. Select one to see its ledger entries."}
                         </p>
                     </div>
                     <button
@@ -504,7 +530,9 @@ export default function App() {
                                             history.slice(0, 12).map((t, i) => {
                                                 const line = describe(t, active.id, items);
                                                 return (
-                                                    <div className="tx" key={String(t.id ?? i)}>
+                                                    <div className="tx clickable" key={String(t.id ?? i)} role="button" tabIndex={0}
+                                                        onClick={() => setOpenTransaction(String(t.id))}
+                                                        onKeyDown={(e) => e.key === "Enter" && setOpenTransaction(String(t.id))}>
                                                         <span className="tx-text">
                                                             <span className="tx-label">{line.label}</span>
                                                             <small>{[line.detail, formatDate(String(t.createdAt ?? ""))].filter(Boolean).join(" · ")}</small>
@@ -578,6 +606,16 @@ export default function App() {
                             </section>
                         )}
                     </>
+                )}
+                {page === "ledger" && isAdmin && token && <Ledger token={token} />}
+                {openTransaction && token && (
+                    <TransactionDetail
+                        token={token}
+                        transactionId={openTransaction}
+                        accountId={selected}
+                        accounts={items}
+                        onClose={() => setOpenTransaction(null)}
+                    />
                 )}
                 {page === "holds" && (
                     <Holds
@@ -654,7 +692,9 @@ export default function App() {
                                                 `${line.label} ${line.detail}`.toLowerCase().includes(search.toLowerCase()),
                                         )
                                         .map(({ t, line }, i) => (
-                                            <tr key={String(t.id ?? i)}>
+                                            <tr key={String(t.id ?? i)} className="clickable" tabIndex={0}
+                                                onClick={() => setOpenTransaction(String(t.id))}
+                                                onKeyDown={(e) => e.key === "Enter" && setOpenTransaction(String(t.id))}>
                                                 <td className="date-cell">{formatDate(String(t.createdAt ?? t.timestamp ?? t.occurredAt ?? '—'))}</td>
                                                 <td className="type-cell">{line.label}</td>
                                                 <td className="detail-cell">{line.detail || "—"}</td>
