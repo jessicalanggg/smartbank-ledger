@@ -36,3 +36,41 @@ select{width:100%;border:1px solid #dce3ee;border-radius:9px;padding:12px;backgr
 .badge.posted{background:#ecfdf3;color:#067647}
 .badge.voided,.badge.expired{background:#f2f4f7;color:#667085}
 .account-card .pending-line{color:#b54708}
+
+/* Sidebar: items grouped closely under the brand */
+aside{gap:4px}
+aside .brand{margin-bottom:26px}
+aside .nav{margin-top:0}
+aside .side-bottom{margin-top:auto}
+
+/* Balances: one total per currency, never mixed */
+.big-currency{font-size:18px;font-weight:600;color:#c8d8fa;margin-left:4px}
+.other-balance{font-size:17px;font-weight:600;color:#e3ecff;margin:-4px 0 10px}
+
+/* Transactions: readable labels, money in and out */
+.tx{align-items:center}
+.tx-text{display:flex;flex-direction:column;gap:3px;min-width:0}
+.tx-label{color:#1d2939;font-weight:600}
+.tx-text small{color:#8791a3;font-size:12px}
+.amount-in{color:#067647}
+.amount-out{color:#1d2939}
+.history-table .detail-cell{color:#5d6b82}
+
+/* Phones: a bottom tab bar replaces the hidden sidebar */
+.tabbar{display:none}
+@media(max-width:520px){
+  .tabbar{display:grid;grid-template-columns:repeat(4,1fr);position:fixed;left:0;right:0;bottom:0;z-index:20;background:#fff;border-top:1px solid #e6ebf2;padding:6px 4px calc(6px + env(safe-area-inset-bottom));box-shadow:0 -6px 18px #1c3e7d12}
+  .tabbar button{display:flex;flex-direction:column;align-items:center;gap:3px;border:0;background:transparent;color:#7c89a4;font-size:11px;font-weight:600;padding:6px 2px;border-radius:9px}
+  .tabbar button.active{color:#225ac8;background:#eaf1ff}
+  .content{padding-bottom:96px}
+  /* The transaction table becomes a stacked list */
+  .history-scroll{overflow-x:visible}
+  .history-table{min-width:0}
+  .history-table thead{display:none}
+  .history-table tr{display:grid;grid-template-columns:1fr auto;grid-template-areas:"type amount" "detail amount" "date amount";padding:12px 0;border-bottom:1px solid #edf0f5}
+  .history-table td{border:0;padding:1px 0}
+  .history-table .type-cell{grid-area:type;font-weight:600;color:#1d2939}
+  .history-table .detail-cell{grid-area:detail;font-size:12px}
+  .history-table .date-cell{grid-area:date;font-size:12px;color:#8791a3}
+  .history-table .amount-cell{grid-area:amount;align-self:center}
+}

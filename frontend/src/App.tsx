@@ -22,10 +22,7 @@ import {
     type Transaction,
     type TransferReceipt
 } from './api';
-const money = (amount: number, currency: string) =>
-    new Intl.NumberFormat("en-CA", { style: "currency", currency }).format(
-        amount,
-    );
+import { describe, money, signedMoney, totalsByCurrency, typeLabel } from "./format";
 const formatDate = (value: string): string => {
     if (!value || value === "—") {
         return "—";
@@ -305,6 +302,21 @@ export default function App() {
                     </button>
                 </div>
             </aside>
+            {/* On phones the sidebar is hidden; this bar takes its place. */}
+            <nav className="tabbar" aria-label="Main">
+                <button type="button" className={page === "overview" ? "active" : ""} onClick={() => setPage("overview")}>
+                    <Wallet size={20} /> <span>Overview</span>
+                </button>
+                <button type="button" className={page === "transactions" ? "active" : ""} onClick={() => setPage("transactions")}>
+                    <History size={20} /> <span>Transactions</span>
+                </button>
+                <button type="button" className={page === "holds" ? "active" : ""} onClick={() => setPage("holds")}>
+                    <Clock size={20} /> <span>Holds</span>
+                </button>
+                <button type="button" onClick={logout}>
+                    <LogOut size={20} /> <span>Sign out</span>
+                </button>
+            </nav>
             <style>{`
                 .transfer-details { display:grid; grid-template-columns: 120px minmax(0,1fr); gap: 12px; margin: 20px 0; }
                 .transfer-details dt { color:#64748b; }
@@ -356,19 +368,27 @@ export default function App() {
                             <div className="eyebrow">
                                 TOTAL AVAILABLE BALANCE
                             </div>
-                            <div className="big-balance">
-                                {money(
-                                    items.reduce(
-                                        (s, a) => s + Number(a.availableBalance ?? a.balance),
-                                        0,
-                                    ),
-                                    "CAD",
-                                )}
-                            </div>
-                            <div className="muted">
-                                Across {items.length} accessible account(s) ·
-                                CAD
-                            </div>
+                            {(() => {
+                                const totals = totalsByCurrency(items);
+                                const [main, ...rest] = totals;
+                                return (
+                                    <>
+                                        <div className="big-balance">
+                                            {main ? money(main.total, main.currency) : money(0, "CAD")}
+                                            {main && <span className="big-currency"> {main.currency}</span>}
+                                        </div>
+                                        {rest.map((t) => (
+                                            <div className="other-balance" key={t.currency}>
+                                                + {money(t.total, t.currency)} {t.currency}
+                                            </div>
+                                        ))}
+                                        <div className="muted">
+                                            Across {items.length} account{items.length === 1 ? "" : "s"}
+                                            {totals.length > 1 ? ` in ${totals.length} currencies, shown separately` : ""}
+                                        </div>
+                                    </>
+                                );
+                            })()}
                         </div>
                         <h2>My accounts</h2>
                         <div className="account-grid">
@@ -434,7 +454,7 @@ export default function App() {
                                     </div>
                                     <form onSubmit={submitAction}>
                                         <label>
-                                            Amount (CAD)
+                                            Amount ({active.currency})
                                             <input
                                                 type="number"
                                                 min="0.01"
@@ -481,27 +501,20 @@ export default function App() {
                                                 No transactions to display.
                                             </div>
                                         ) : (
-                                            history.slice(0, 12).map((t, i) => (
-                                                <div className="tx" key={i}>
-                                                    <span>
-                                                        {String(
-                                                            t.description ??
-                                                            t.type ??
-                                                            "Transaction",
-                                                        )}
-                                                    </span>
-                                                    <strong>
-                                                        {t.amount !== undefined
-                                                            ? money(
-                                                                Number(
-                                                                    t.amount,
-                                                                ),
-                                                                active.currency,
-                                                            )
-                                                            : "—"}
-                                                    </strong>
-                                                </div>
-                                            ))
+                                            history.slice(0, 12).map((t, i) => {
+                                                const line = describe(t, active.id, items);
+                                                return (
+                                                    <div className="tx" key={String(t.id ?? i)}>
+                                                        <span className="tx-text">
+                                                            <span className="tx-label">{line.label}</span>
+                                                            <small>{[line.detail, formatDate(String(t.createdAt ?? ""))].filter(Boolean).join(" · ")}</small>
+                                                        </span>
+                                                        <strong className={line.amount >= 0 ? "amount-in" : "amount-out"}>
+                                                            {signedMoney(line.amount, line.currency)}
+                                                        </strong>
+                                                    </div>
+                                                );
+                                            })
                                         )}
                                     </div>
                                 </section>
@@ -608,7 +621,7 @@ export default function App() {
                                         ),
                                     ).map((t) => (
                                         <option key={t} value={t}>
-                                            {t}
+                                            {typeLabel(t)}
                                         </option>
                                     ))}
                                 </select>
@@ -618,7 +631,7 @@ export default function App() {
                                 <input
                                     value={search}
                                     onChange={(e) => setSearch(e.target.value)}
-                                    placeholder="Description or type"
+                                    placeholder="Type or account number"
                                 />
                             </label>
                         </div>
@@ -628,41 +641,25 @@ export default function App() {
                                     <tr>
                                         <th>Date</th>
                                         <th>Type</th>
-                                        <th>Description</th>
-                                        <th>Amount</th>
+                                        <th>Details</th>
+                                        <th className="amount-cell">Amount</th>
                                     </tr>
                                 </thead>
                                 <tbody>
                                     {history
+                                        .map((t) => ({ t, line: describe(t, selected, items) }))
                                         .filter(
-                                            (t) =>
-                                                (filter === "all" ||
-                                                    String(
-                                                        t.type ?? "UNKNOWN",
-                                                    ) === filter) &&
-                                                `${String(t.description ?? "")} ${String(t.type ?? "")}`
-                                                    .toLowerCase()
-                                                    .includes(
-                                                        search.toLowerCase(),
-                                                    ),
+                                            ({ t, line }) =>
+                                                (filter === "all" || String(t.type ?? "UNKNOWN") === filter) &&
+                                                `${line.label} ${line.detail}`.toLowerCase().includes(search.toLowerCase()),
                                         )
-                                        .map((t, i) => (
+                                        .map(({ t, line }, i) => (
                                             <tr key={String(t.id ?? i)}>
-                                                <td>{formatDate(String(t.createdAt ?? t.timestamp ?? t.occurredAt ?? '—'))}</td>
-                                                <td>{String(t.type ?? "—")}</td>
-                                                <td>
-                                                    {String(
-                                                        t.description ?? "—",
-                                                    )}
-                                                </td>
-                                                <td className="amount-cell">
-                                                    {t.amount !== undefined
-                                                        ? money(
-                                                            Number(t.amount),
-                                                            active?.currency ??
-                                                            "CAD",
-                                                        )
-                                                        : "—"}
+                                                <td className="date-cell">{formatDate(String(t.createdAt ?? t.timestamp ?? t.occurredAt ?? '—'))}</td>
+                                                <td className="type-cell">{line.label}</td>
+                                                <td className="detail-cell">{line.detail || "—"}</td>
+                                                <td className={`amount-cell ${line.amount >= 0 ? "amount-in" : "amount-out"}`}>
+                                                    {signedMoney(line.amount, line.currency)}
                                                 </td>
                                             </tr>
                                         ))}
